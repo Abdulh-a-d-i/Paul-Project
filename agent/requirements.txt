@@ -1,0 +1,12 @@
+livekit-agents
+python-dotenv
+livekit-plugins-deepgram
+livekit-plugins-openai
+livekit-plugins-elevenlabs
+livekit-plugins-silero
+livekit.plugins.turn_detector
+google-cloud-storage==2.18.2
+google-auth==2.35.0
+httpx
+requests
+tenacity
