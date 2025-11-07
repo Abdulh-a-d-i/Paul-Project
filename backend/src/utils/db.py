@@ -62,7 +62,7 @@ class PGDB:
                     CREATE TABLE IF NOT EXISTS user_prompts (
                         id SERIAL PRIMARY KEY,
                         user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-                        system_prompt TEXT DEFAULT 'You are SUMA, a helpful AI assistant. Be professional and courteous in all interactions.',
+                        system_prompt TEXT DEFAULT 'You are Paul, a helpful AI assistant. Be professional and courteous in all interactions.',
                         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                     );
@@ -76,7 +76,7 @@ class PGDB:
         except Exception as e:
             logging.error(f"Error creating user_prompts table: {e}")
         finally:
-            conn.close()
+            self.release_connection(conn)
 
 
     def create_default_user_prompt(self, user_id: int):
@@ -87,7 +87,7 @@ class PGDB:
         conn = self.get_connection()
         try:
             with conn.cursor() as cursor:
-                default_prompt = """You are SUMA, you makes phone calls to businesses on behalf of clients to book appointments and reservations.
+                default_prompt = """You are Paul, you makes phone calls to businesses on behalf of clients to book appointments and reservations.
 
                 ### IDENTITY & ROLE
 
@@ -145,8 +145,7 @@ class PGDB:
         except Exception as e:
             logging.error(f"Error creating default prompt: {e}")
         finally:
-            conn.close()
-
+            self.release_connection(conn)
 
     def get_user_prompt(self, user_id: int) -> dict:
         """
@@ -185,7 +184,7 @@ class PGDB:
                 
                 return result
         finally:
-            conn.close()
+            self.release_connection(conn)
 
 
     def update_user_system_prompt(self, user_id: int, system_prompt: str):
@@ -218,14 +217,14 @@ class PGDB:
             logging.error(f"Error updating user prompt: {e}")
             raise
         finally:
-            conn.close()
+            self.release_connection(conn)
 
 
     def reset_user_prompt_to_default(self, user_id: int):
         """
         Reset user's prompt to default text.
         """
-        default_prompt = """You are SUMA, a professional AI assistant for business services.
+        default_prompt = """You are Paul, a professional AI assistant for business services.
 
     Your responsibilities:
     - Help schedule appointments and meetings
@@ -250,7 +249,7 @@ class PGDB:
         if not prompt_data:
             # Return default if not found
             return {
-                "system_prompt": """You are SUMA, a professional AI assistant for business services.
+                "system_prompt": """You are Paul, a professional AI assistant for business services.
 
     Your responsibilities:
     - Help schedule appointments and meetings
@@ -294,7 +293,7 @@ class PGDB:
         except Exception as e:
             logging.error(f"Error updating call_history for recordings: {e}")
         finally:
-            conn.close()
+            self.release_connection(conn)
 
    
 
@@ -863,7 +862,7 @@ class PGDB:
     #         logging.error(f"Error fetching call history for user_id={user_id}: {e}")
     #         raise
     #     finally:
-    #         conn.close()
+    #         self.release_connection(conn)
 
     def get_call_history_by_user_id(self, user_id: int, page: int = 1, page_size: int = 10):
         conn = self.get_connection()
@@ -1312,7 +1311,7 @@ class PGDB:
 #         except Exception as e:
 #             logging.error(f"Error creating users table: {e}")
 #         finally:
-#             conn.close()
+#             self.release_connection(conn)
 
 
 #     def create_call_history_table(self):
@@ -1347,7 +1346,7 @@ class PGDB:
 #         except Exception as e:
 #             logging.error(f"Error creating call_history table: {e}")
 #         finally:
-#             conn.close()
+#             self.release_connection(conn)
 
 
 
@@ -1394,7 +1393,7 @@ class PGDB:
 #             logging.error(f"Error in register_user: {e}")
 #             raise
 #         finally:
-#             conn.close()
+#             self.release_connection(conn)
 
 #     def login_user(self, user_data):
 #         """Verify user credentials by username or email and return user info."""
@@ -1426,7 +1425,7 @@ class PGDB:
 #             logging.error(f"Error during login: {str(e)}")
 #             raise
 #         finally:
-#             conn.close()
+#             self.release_connection(conn)
 
 
 #     def get_user_by_id(self, user_id: int):
@@ -1441,7 +1440,7 @@ class PGDB:
 #                 return cursor.fetchone()
 #         finally:
 #             if conn:
-#                 conn.close()
+#                 self.release_connection(conn)
 
 #     def delete_user_by_id(self,user_id):
 #         """
@@ -1466,7 +1465,7 @@ class PGDB:
 #                 return False
 #         finally:
 #             if conn:
-#                 conn.close()
+#                 self.release_connection(conn)
 
 #     def update_user_name_fields(self, user_id: int, first_name: str, last_name: str):
 #         conn = self.get_connection()
@@ -1485,7 +1484,7 @@ class PGDB:
 #             logging.error(f"Error updating name fields: {e}")
 #             return False
 #         finally:
-#             conn.close()
+#             self.release_connection(conn)
 
 #     def change_user_password(self, user_id: int, current_password: str, new_password: str):
 #         conn = self.get_connection()
@@ -1516,7 +1515,7 @@ class PGDB:
 #             logging.error(f"Password change error: {e}")
 #             raise
 #         finally:
-#             conn.close()            
+#             self.release_connection(conn)     
 
 #     def get_all_users(self):
 #         query = """
@@ -1543,7 +1542,7 @@ class PGDB:
 #                     for row in result
 #                 ]
 #         finally:
-#             conn.close()
+#             self.release_connection(conn)
 
 #     def get_all_users_paginated(self, page: int = 1, page_size: int = 10):
 #         query_total = "SELECT COUNT(*) FROM users WHERE is_admin = FALSE"
@@ -1589,7 +1588,7 @@ class PGDB:
 #             print(f"Error fetching paginated users: {e}")
 #             return {"users": [], "total": 0}
 #         finally:
-#             conn.close()            
+#             self.release_connection(conn)
 
 
 #     # ================================ call history logic ==================================
@@ -1654,7 +1653,7 @@ class PGDB:
 #     #         conn.rollback()
 #     #         raise
 #     #     finally:
-#     #         conn.close()
+#     #         self.release_connection(conn)
 
 #     def insert_call_history(
 #         self, user_id: int, call_id: str, status: str,
@@ -1679,7 +1678,7 @@ class PGDB:
 #             conn.rollback()
 #             raise
 #         finally:
-#             conn.close()
+#             self.release_connection(conn)
 
 
 #     def get_call_history_by_user_id(self, user_id: int):
@@ -1717,7 +1716,7 @@ class PGDB:
 #             logging.error(f"Error fetching call history for user_id={user_id}: {e}")
 #             raise
 #         finally:
-#             conn.close()
+#             self.release_connection(conn)
                     
 
 #     # def update_call_status(self, call_id: str, status: str):
@@ -1735,7 +1734,7 @@ class PGDB:
 #     #         conn.rollback()
 #     #         raise
 #     #     finally:
-#     #         conn.close()
+#     #         self.release_connection(conn)
 
 
 #     # def update_call_status(self, call_id: str, status: str):
@@ -1753,7 +1752,7 @@ class PGDB:
 #     #         conn.rollback()
 #     #         raise
 #     #     finally:
-#     #         conn.close()
+#     #         self.release_connection(conn)
 
 #     def update_call_status(self, call_id: str, status: str):
 #         conn = self.get_connection()
@@ -1770,7 +1769,7 @@ class PGDB:
 #             conn.rollback()
 #             raise
 #         finally:
-#             conn.close()
+#             self.release_connection(conn)
 
 
 
@@ -1799,7 +1798,7 @@ class PGDB:
 #     #         conn.rollback()
 #     #         raise
 #     #     finally:
-#     #         conn.close()
+#     #         self.release_connection(conn)
 
 #     def update_call_details(
 #         self, call_id: str, status: str, duration: int,
@@ -1833,4 +1832,4 @@ class PGDB:
 #             conn.rollback()
 #             raise
 #         finally:
-#             conn.close()
+#             self.release_connection(conn)

@@ -108,18 +108,18 @@ def login_user(user: UserLogin):
 
 voices = {
     # English voices
-    "david": "1SM7GgM6IMuvQlz2BwM3",
-    "ravi": "A7AUsa1uITCDpK29MG3m",
-    "emily-british": "9YWmufCrZ2agGoSoVL8je",
-    "alice-british": "XcXEQzuLXRU9RcfWzEJt",
-    "julia-british": "ZtcPZrt9K4w8e1OB9M6w",
+    "david":"tNIuvXGG5RnGdTbvfnPR", # "1SM7GgM6IMuvQlz2BwM3",
+    "ravi": "lyPbHf3pO5t4kYZYenaY", # indian ancent
+    "emily-british": "pjcYQlDFKMbcOUp6F5GD", #"9YWmufCrZ2agGoSoVL8je",
+    "alice-british": "uYXf8XasLslADfZ2MB4u", #"XcXEQzuLXRU9RcfWzEJt",
+    "julia-british": "MzqUf1HbJ8UmQ0wUsx2p", #"ZtcPZrt9K4w8e1OB9M6w",
     
     # Spanish voices
-    "julio": "A7AUsa1uITCDpK29MG3m",
-    "donato": "851ejYcv2BoNPjrkw93G",
-    "helena-spanish": "5vkxOzoz40FrElmLP4P7",
-    "rosa": "BIvP0GN1cAtSRTxNHnWS",
-    "mariam": "90ipbRoKi4CpHXvKVtl0",
+    "julio": "KH1SQLVulwP6uG4O3nmT", #"A7AUsa1uITCDpK29MG3m", 
+    "donato": "UgBBYS2sOqTuMpoF3BR0", #"851ejYcv2BoNPjrkw93G",
+    "helena-spanish": "aTxZrSrp47xsP6Ot4Kgd", #"5vkxOzoz40FrElmLP4P7",
+    "rosa": "TgnhEILA8UwUqIMi20rp", #"BIvP0GN1cAtSRTxNHnWS",
+    "mariam": "1ea3IFhmSWgw8sJkSvfJ", #"90ipbRoKi4CpHXvKVtl0",
 }
 
 @router.post("/assistant-initiate-call")
@@ -172,13 +172,17 @@ async def make_call_with_livekit(payload: Assistant_Payload, user=Depends(get_cu
             "call_context": payload.context,
             "user_id": user["id"],
             "caller_name": payload.caller_name,
-            "caller_email": payload.caller_email,
+            # "caller_email": payload.caller_email,
+            "caller_email": user["email"],#payload.caller_email,
             "system_prompt": complete_system_prompt,
-            "agent_name": "SUMA",
+            "agent_name": "PAUL",
             "voice_id": voice_id,        
             "voice_name": voice_name,    
             "language": language         
         }
+        print("\n\n")
+        print(metadata)
+        print("\n\n")
 
         #  STEP 4: Create DB record
         db.insert_call_history(
@@ -776,7 +780,8 @@ async def receive_agent_event(request: Request):
                     if row and not row[0]:
                         updates["started_at"] = now
             finally:
-                conn.close()
+                # conn.close()
+                db.release_connection(conn)
         
         #  Handle unanswered
         if status == "unanswered":

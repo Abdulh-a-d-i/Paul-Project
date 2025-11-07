@@ -453,7 +453,7 @@ class SystemPromptBuilder:
             
         except Exception as e:
             logger.error(f"Error generating system prompt: {e}")
-            return f"You are SUMA, calling on behalf of {self.caller_name}. {self.call_context}"
+            return f"You are Paul, calling on behalf of {self.caller_name}. {self.call_context}"
 
     @classmethod
     def get_default_base_prompt(cls) -> str:

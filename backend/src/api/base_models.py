@@ -60,7 +60,7 @@ class Assistant_Payload(BaseModel):
     caller_name: str          # Your name/company name
     caller_email: str         # Your email (for sending calendar invites)
     caller_number: str        # Your phone number
-    objective: str
+    # objective: str
     context: str
     language: str 
     voice: str 
