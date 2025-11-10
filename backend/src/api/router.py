@@ -293,8 +293,13 @@ async def livekit_webhook(request: Request):
                 return JSONResponse({"message": "Duration updated"})
 
             #  Determine final status
+            previously_connected = current_status in {"connected", "completed"}
+
             answered = check_if_answered(events_log)
-            final_status = "completed" if answered else "unanswered"
+            if answered or previously_connected:
+                final_status = "completed"
+            else:
+                final_status = "unanswered"
             
             started = db_started_at or created_at
             ended = datetime.now(timezone.utc)
