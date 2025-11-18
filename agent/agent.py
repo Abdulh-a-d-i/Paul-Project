@@ -44,7 +44,7 @@ logger.setLevel(logging.INFO)
 
 # Environment variables
 OUTBOUND_TRUNK_ID = os.getenv("SIP_OUTBOUND_TRUNK_ID")
-BACKEND_API_URL = os.getenv("BACKEND_API_URL")
+BACKEND_API_URL = os.getenv("BACKEND_API_URL", "https://full-shrimp-deeply.ngrok-free.app")
 GOOGLE_BUCKET_NAME = os.getenv("GOOGLE_BUCKET_NAME") or os.getenv("GCS_BUCKET_NAME")
 GCP_KEY_B64 = os.getenv("GCP_SERVICE_ACCOUNT_KEY_BASE64")
 UPLOAD_TRANSCRIPTS = os.getenv("UPLOAD_TRANSCRIPTS", "true").lower() in ("1", "true", "yes")
@@ -884,7 +884,7 @@ async def entrypoint(ctx: JobContext):
         tts=elevenlabs.TTS(
             api_key=os.getenv("ELEVENLABS_API_KEY"),
             model="eleven_flash_v2_5",
-            voice_id="1SM7GgM6IMuvQlz2BwM3"
+            voice_id=voice_id
         ),
         vad=silero.VAD.load(min_silence_duration=0.05),
         turn_detection=turn_detector,       
@@ -1106,8 +1106,15 @@ async def entrypoint(ctx: JobContext):
         )
 
         await asyncio.sleep(0.5)
+        if language == "es":
+            greeting = f"¡Hola! Soy {agent.agent_name} llamando de parte de {agent.caller_name}. ¿Cómo estás hoy?"
+        else: # Default to English
+            greeting = f"Hi! This is {agent.agent_name} calling on behalf of {agent.caller_name}. How are you doing today?"
+
+        # Speak the selected greeting
+        logger.info(f"🗣️ Speaking initial greeting in '{language}': {greeting}")
         await session.say(
-            f"Hi! This is paul calling on behalf of {agent.caller_name}. How are you doing today?",
+            greeting,
             allow_interruptions=True
         )
 

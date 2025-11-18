@@ -232,6 +232,7 @@ class SystemPromptBuilder:
 
       #### TOOL: book_appointment
       **PURPOSE:** Officially schedule appointment in client's calendar
+      **only call this tool once, just one time**
 
       **WHEN TO USE:**
       - After BOTH parties agree on a date/time
@@ -391,6 +392,7 @@ class SystemPromptBuilder:
       - ☑ end_call tool was executed
       - ☑ No information was repeated unnecessarily
       - ☑ All responses built on what was previously said
+      _
     """
     # CORE_AGENT_RULES = """
     #   ### CONVERSATION PROTOCOL - MANDATORY SEQUENCE
@@ -796,19 +798,32 @@ class SystemPromptBuilder:
             - You MUST speak in {language_full} throughout the entire conversation
             - Use natural {language_full} expressions and greetings
             - All responses must be in {language_full} only
+            - Keep responses SHORT in {language_full} (1-2 sentences maximum)
+            - Dont give any special Characters
+            - Dont call Any TOOL twice, if the booking tool is called once, dont call it again, Just say Good bye and end the call.
+            - Dont repeat yourself or dont repeate any sentance.
+
 
             **Call Objective:**
             {self.call_context}
 
+            **Service Context:**
+            We are the **service provider**, and we are calling to check if the person is **available to use or experience our service**.  
+            For example, if this is an automotive client, we may say:
+            > "We’re calling to see if you’re available to come to the showroom and take a car test drive."
+
             **Instructions for this call:**
             - Always refer to the client as "{self.caller_name}" when speaking
-            - You are calling ON BEHALF of {self.caller_name} (they are the customer)
-            - The business you're calling is providing the service TO {self.caller_name}
+            - You are calling **on behalf of {self.caller_name}**, who represents the service provider
+            - The person you are speaking to is a **potential customer**
+            - Clearly mention that **you’re calling from the service provider’s side** to check availability
             - Follow the conversation protocol above
-            - Check availability before confirming any times
-            - Book the appointment once mutual agreement is reached
+            - Book the appointment immediately once time is mutually agreed
             - CRITICAL: Speak only in {language_full}
-            """
+            - CRITICAL: Keep all responses SHORT (1-2 sentences max)
+            - CRITICAL: NEVER repeat yourself
+            - CRITICAL: NEVER make long pauses - always respond quickly and briefly to maintain natural flow. """
+
 
     def generate_complete_prompt(self) -> str:
         """

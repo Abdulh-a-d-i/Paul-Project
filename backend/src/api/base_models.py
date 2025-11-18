@@ -69,3 +69,27 @@ class Assistant_Payload(BaseModel):
 
 class PromptCustomizationUpdate(BaseModel):
     system_prompt: str = Field(..., min_length=10, max_length=10000)
+
+
+class ContactUploadResponse(BaseModel):
+    success: bool
+    message: str
+    stats: dict
+
+class ContactsListResponse(BaseModel):
+    contacts: list
+    pagination: Optional[dict] = None
+
+
+
+class ContactUploadStats(BaseModel):
+    total_rows: int
+    inserted: int
+    duplicates: int = 0
+    skipped: int = 0
+    errors: int = 0
+
+class ContactUploadResponse(BaseModel):
+    success: bool
+    message: str
+    stats: ContactUploadStats

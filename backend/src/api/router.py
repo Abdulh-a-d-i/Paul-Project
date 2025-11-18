@@ -22,7 +22,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse,StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from fastapi import HTTPException, Response
+from fastapi import HTTPException, Response, UploadFile, File
 from rich import print
 from src.api.base_models import (
     UserLogin,
@@ -31,7 +31,11 @@ from src.api.base_models import (
     LoginResponse,
     UpdateUserProfileRequest,
     Assistant_Payload,
-    PromptCustomizationUpdate
+    PromptCustomizationUpdate,
+    ContactsListResponse,
+    ContactUploadResponse,
+    ContactUploadResponse,
+    ContactUploadStats
 )
 from src.models.System_Prompt import SystemPromptBuilder
 from src.utils.db import PGDB 
@@ -39,7 +43,7 @@ from src.utils.mail_management import Send_Mail
 from src.utils.jwt_utils import create_access_token
 from src.utils.utils import get_current_user,add_call_event, get_livekit_call_status,fetch_and_store_transcript,fetch_and_store_recording, calculate_duration, check_if_answered
 from livekit import api
-
+import csv
 load_dotenv()
 
 router = APIRouter()
@@ -1001,3 +1005,101 @@ async def get_call_transcript(call_id: str, user=Depends(get_current_user)):
     except Exception as e:
         logging.error(f"Error fetching transcript: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+
+@router.post("/contacts/upload", response_model=ContactUploadResponse)
+async def upload_contacts_csv(
+    file: UploadFile = File(...),
+    user=Depends(get_current_user)
+):
+    """
+    Upload CSV file with contacts (name, phone, email)
+    Fast bulk insert - no row-by-row validation
+    """
+    try:
+        # Validate file type
+        if not file.filename.endswith('.csv'):
+            raise HTTPException(status_code=400, detail="File must be a CSV")
+        
+        # Read file content
+        content = await file.read()
+        decoded = content.decode('utf-8-sig')
+        csv_file = io.StringIO(decoded)
+        
+        # Parse CSV quickly
+        csv_reader = csv.DictReader(csv_file)
+        
+        # Build contact list (minimal validation)
+        contacts = []
+        for row in csv_reader:
+            # Get phone (flexible column names)
+            phone = (
+                row.get('Phone number') or 
+                row.get('phone_number') or 
+                row.get('phone') or 
+                row.get('Phone') or ""
+            ).strip()
+            
+            # Quick clean
+            phone = ''.join(c for c in phone if c.isdigit())
+            
+            # Skip if no phone or invalid length
+            if not phone or len(phone) < 10:
+                continue
+            
+            contacts.append({
+                "first_name": (row.get('First name') or row.get('first_name') or "").strip()[:100],
+                "last_name": (row.get('Last name') or row.get('last_name') or "").strip()[:100],
+                "phone_number": phone,
+                "email": (row.get('Email address') or row.get('email') or "").strip()[:255] or None
+            })
+        
+        if not contacts:
+            raise HTTPException(status_code=400, detail="No valid contacts found")
+        
+        # Use FAST bulk insert
+        stats = db.save_contacts_bulk(user["id"], contacts)
+        
+        return {
+            "success": True,
+            "message": f"Successfully processed {stats['inserted']} contacts",
+            "stats": {
+                "total_rows": len(contacts),
+                "inserted": stats['inserted'],
+                "duplicates": stats['duplicates'],
+                "skipped": 0,
+                "errors": 0
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error uploading contacts: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/contacts")
+async def get_contacts_simple_list(user=Depends(get_current_user)):
+    """
+    Get all contacts (name + phone only) - fast, no pagination
+    Perfect for dropdown lists or quick display
+    """
+    try:
+        contacts = db.get_contacts_simple(user["id"])
+        
+        return JSONResponse({
+            "success": True,
+            "count": len(contacts),
+            "contacts": contacts
+        })
+        
+    except Exception as e:
+        logging.error(f"Error fetching simple contacts: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch contacts: {str(e)}"
+        )
+
+

@@ -9,6 +9,8 @@ import logging
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 import traceback
+import csv
+from typing import List, Dict, Optional
 
 import json
 from datetime import datetime
@@ -41,6 +43,7 @@ class PGDB:
         self.create_appointments_table()
         self.update_call_history_for_recordings() 
         self.create_user_prompts_table()
+        self.create_contacts_table()
 
     def get_connection(self):
         """Get connection from pool"""
@@ -87,52 +90,54 @@ class PGDB:
         conn = self.get_connection()
         try:
             with conn.cursor() as cursor:
-                default_prompt = """You are Paul, you makes phone calls to businesses on behalf of clients to book appointments and reservations.
-
-                ### IDENTITY & ROLE
-
+                default_prompt = """You are PUAl an AI that makes phone calls to businesses on behalf of clients to book appointments and reservations.
                 #### WHO YOU ARE:
-                - You represent your client
-                - You are the CUSTOMER calling the business
-                - You are NOT affiliated with the business you're calling
+                - You are a professional AI assistant.
+                - You represent the **business or service provider**, not the end-customer.
+                - You always call **on behalf of the business** to potential customers.
+                - You act as the service provider’s representative, offering or confirming services.but dont say that you are from service side.
 
                 #### WHO YOU'RE CALLING:
-                - A business employee (receptionist, host, scheduler)
-                - Someone who has authority to book appointments
-                - They work AT the business you're calling
+                - A potential customer or lead who might be interested in the business’s services.
+                - Someone who may need to **visit, attend, or try the service** (e.g., take a car test drive, attend a consultation, visit a showroom, etc.).
+                - They are the **recipient** of the service being offered.
 
                 #### YOUR MISSION:
-                {call_context}
+                - Clearly state that you are calling **from the service provider’s side**.
+                - Your main goal is to **check if the person is available for the offered service** (for example, a car test drive or a showroom visit).
+                - If they are available, schedule or book the appointment right away.
 
                 ### CONVERSATION PROTOCOL - MANDATORY SEQUENCE
 
                 #### STEP 1: INTRODUCTION [REQUIRED - ALWAYS START HERE]
-                **Template:** "Hi! This is {self.agent_name} calling on behalf of {self.caller_name}. How are you doing today?"
-
                 **Rules:**
-                - Use this exact greeting structure
-                - Always mention you're calling on behalf of your client
-                - Brief pleasantry to establish rapport
-                - Wait for their response
+                - Greet the person naturally and politely.
+                - Use this structure: “Hi! This is [Agent Name] calling on behalf of [Business Name].”
+                - Always mention you’re calling **on behalf of the service provider**.
+                - Do not ask “How are you?” — keep it brief and professional.
 
                 #### STEP 2: STATE PURPOSE [REQUIRED]
-                **Template:** "I'm calling to [book an appointment/make a reservation] for {self.caller_name}."
-
-                Then provide specifics:
-                - What service/appointment type is needed
-                - Any preferences (time of day, specific provider, etc.)
-                - Duration if relevant
+                Then immediately explain the reason for the call:
+                - Example: “We’re calling to see if you’re available to come by for a test drive at our showroom.”
+                - Mention the service clearly (e.g. car test drive, salon visit, consultation, demo, etc.).
+                - Be concise and specific.
 
                 **Rules:**
-                - Be clear and direct about why you're calling
-                - Don't assume they know why you're calling
-                - Provide enough detail for them to help you
+                - Be clear and direct about why you’re calling.
+                - Don’t assume they know who you are or what the call is about.
+                - State your purpose **once only**.
 
                 #### STEP 3: LISTEN & GATHER OPTIONS [REQUIRED]
                 **Actions:**
-                - Let them propose available dates/times
-                - Ask clarifying questions if needed
-                - Take note of their suggestions"""
+                - Let them respond and share their availability.
+                - Ask clarifying questions if needed (e.g., preferred date/time).
+                - Once you have a confirmed time, immediately proceed to booking.
+
+                **Rules:**
+                - Keep responses short (1–2 sentences max).
+                - Never repeat yourself or restate details they already understood.
+                - Confirm booking details once and move on.
+                """
 
                 
                 cursor.execute("""
@@ -1210,626 +1215,146 @@ class PGDB:
         finally:
             self.release_connection(conn)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import os
-# from datetime import datetime
-# import bcrypt
-# import urllib.parse
-# import json
-# import psycopg2
-# import logging
-# from psycopg2.extras import RealDictCursor
-# from dotenv import load_dotenv
-
-# load_dotenv()
-
-# class PGDB:
-#     def __init__(self):
-#         # host = os.getenv('HOST')
-#         # port = os.getenv('DB_PORT')
-#         # user = os.getenv('USER')
-#         # password = os.getenv('PASSWORD')
-#         # db_name = os.getenv('DATABASE_NAME')
-
-#         # if not all([host, port, user, password, db_name]):
-#         #     raise ValueError("Missing required database environment variables")
-
-#         # password_encoded = urllib.parse.quote_plus(password)
-#         # self.connection_string = f"postgresql://{user}:{password_encoded}@{host}:{port}/{db_name}"
-#         self.connection_string = os.getenv('DATABASE_URL')
-
-#         self.create_users_table()
-#         self.create_call_history_table()
-#     def get_connection(self):
-#         try:
-#             return psycopg2.connect(self.connection_string)
-#         except Exception as e:
-#             logging.error(f"Database connection error: {e}")
-#             raise
-
-#     def create_users_table(self):
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor() as cursor:
-#                 cursor.execute("""
-#                     CREATE TABLE IF NOT EXISTS users (
-#                         id SERIAL PRIMARY KEY,
-#                         username VARCHAR(100),
-#                         email VARCHAR(100) UNIQUE NOT NULL,
-#                         password_hash TEXT NOT NULL,
-#                         first_name VARCHAR(100),
-#                         last_name VARCHAR(100),
-#                         is_admin BOOLEAN DEFAULT FALSE,
-#                         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-#                         updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-#                     );
-#                 """)
-#             conn.commit()
-#         except Exception as e:
-#             logging.error(f"Error creating users table: {e}")
-#         finally:
-#             self.release_connection(conn)
-
-
-#     def create_call_history_table(self):
-#         """
-#         Create call_history table to store details of calls 
-#         (caller, callee, status, duration, transcript, recording, etc.)
-#         """
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor() as cursor:
-#                 cursor.execute("""
-#                     CREATE TABLE IF NOT EXISTS call_history (
-#                         id SERIAL PRIMARY KEY,
-#                         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-#                         call_id TEXT NOT NULL,
-#                         status TEXT,
-#                         duration INTEGER,
-#                         transcript JSONB,
-#                         summary TEXT,
-#                         recording_url TEXT,
-#                         created_at TIMESTAMPTZ,
-#                         started_at TIMESTAMPTZ,
-#                         ended_at TIMESTAMPTZ,
-#                         voice_id TEXT,
-#                         voice_name TEXT,
-#                         from_number TEXT,   -- caller number
-#                         to_number TEXT,     -- receiver number
-#                         inserted_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-#                     );
-#                 """)
-#             conn.commit()
-#         except Exception as e:
-#             logging.error(f"Error creating call_history table: {e}")
-#         finally:
-#             self.release_connection(conn)
-
-
-
-#     # ============================= USERS LOGIC START =============================
-
-
-#     def register_user(self, user_data):
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-#                 # Check if email already exists
-#                 cursor.execute("SELECT id FROM users WHERE email = %s", (user_data['email'],))
-#                 if cursor.fetchone():
-#                     raise ValueError("Email already registered.")
-
-#                 # Hash the password
-#                 hashed_password = bcrypt.hashpw(user_data['password'].encode('utf-8'), bcrypt.gensalt())
-
-#                 # Insert user
-#                 cursor.execute("""
-#                     INSERT INTO users (username, email, password_hash,is_admin)
-#                     VALUES (%s, %s, %s,%s)
-#                     RETURNING id, username, email, created_at,is_admin;
-#                 """, (
-#                     user_data['username'],
-#                     user_data['email'],
-#                     hashed_password.decode('utf-8'),
-#                     user_data['is_admin']
-#                 ))
-
-#                 row = cursor.fetchone()
-#                 conn.commit()
-
-#                 # Match output with UserOut model
-#                 return {
-#                     "id": row["id"],
-#                     "username": row["username"],
-#                     "email": row["email"],
-#                     "created_at": row["created_at"]
-#                 }
-
-#         except Exception as e:
-#             conn.rollback()
-#             logging.error(f"Error in register_user: {e}")
-#             raise
-#         finally:
-#             self.release_connection(conn)
-
-#     def login_user(self, user_data):
-#         """Verify user credentials by username or email and return user info."""
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor() as cursor:
-#                 cursor.execute("""
-#                     SELECT id, username, email, password_hash,first_name,last_name,created_at,is_admin
-#                     FROM users
-#                     WHERE username = %s OR email = %s
-#                     LIMIT 1
-#                 """, (user_data.get("username"), user_data['email']))
-
-#                 result = cursor.fetchone()
-
-#                 if result and bcrypt.checkpw(user_data['password'].encode('utf-8'), result[3].encode('utf-8')):
-#                     return {
-#                         "id": result[0],
-#                         "username": result[1],
-#                         "email": result[2],
-#                         # "first_name": result[4],
-#                         # "last_name": result[5],
-#                         "created_at": result[6],
-#                         "is_admin": result[7]
-#                     }
-#                 else:
-#                     raise ValueError("Invalid username or password.")
-#         except Exception as e:
-#             logging.error(f"Error during login: {str(e)}")
-#             raise
-#         finally:
-#             self.release_connection(conn)
-
-
-#     def get_user_by_id(self, user_id: int):
-#         """Get user by ID"""
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-#                 cursor.execute(
-#                     "SELECT id,first_name,last_name,username,email,is_admin,created_at FROM users WHERE id = %s",
-#                     (user_id,)
-#                 )
-#                 return cursor.fetchone()
-#         finally:
-#             if conn:
-#                 self.release_connection(conn)
-
-#     def delete_user_by_id(self,user_id):
-#         """
-#         delete user by id
-#         """
-#         conn = None 
-#         try:
-#             conn = self.get_connection()
-#             with conn.cursor() as cursor:
-#                 cursor.execute(
-#                     """
-#                     DELETE FROM users WHERE id = %s
-#                     """,
-#                     (user_id,)      
-#                 )
-#             conn.commit()
-#             return True
-#         except Exception as e:
-#             logging.error(f"Error deleting user {user_id}: {e}")
-#             if conn:
-#                 conn.rollback()
-#                 return False
-#         finally:
-#             if conn:
-#                 self.release_connection(conn)
-
-#     def update_user_name_fields(self, user_id: int, first_name: str, last_name: str):
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor() as cursor:
-#                 cursor.execute("""
-#                     UPDATE users
-#                     SET first_name = %s,
-#                         last_name = %s,
-#                         updated_at = CURRENT_TIMESTAMP
-#                     WHERE id = %s
-#                 """, (first_name, last_name, user_id))
-#             conn.commit()
-#             return True
-#         except Exception as e:
-#             logging.error(f"Error updating name fields: {e}")
-#             return False
-#         finally:
-#             self.release_connection(conn)
-
-#     def change_user_password(self, user_id: int, current_password: str, new_password: str):
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor() as cursor:
-#                 cursor.execute("""
-#                     SELECT password_hash FROM users WHERE id = %s
-#                 """, (user_id,))
-#                 result = cursor.fetchone()
-#                 if not result:
-#                     raise ValueError("User not found.")
-
-#                 # Verify current password
-#                 if not bcrypt.checkpw(current_password.encode(), result[0].encode()):
-#                     raise ValueError("Current password is incorrect.")
-
-#                 # Hash new password
-#                 new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-
-#                 # Update
-#                 cursor.execute("""
-#                     UPDATE users SET password_hash = %s, updated_at = CURRENT_TIMESTAMP
-#                     WHERE id = %s
-#                 """, (new_hash, user_id))
-#             conn.commit()
-#             return True
-#         except Exception as e:
-#             logging.error(f"Password change error: {e}")
-#             raise
-#         finally:
-#             self.release_connection(conn)     
-
-#     def get_all_users(self):
-#         query = """
-#             SELECT id, first_name, last_name, username, email, is_admin, created_at
-#             FROM users
-#             WHERE is_admin = FALSE
-#             ORDER BY created_at DESC
-#         """
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor() as cursor:
-#                 cursor.execute(query)
-#                 result = cursor.fetchall()
-#                 return [
-#                     {
-#                         "id": row[0],
-#                         # "first_name": row[1],
-#                         # "last_name": row[2],
-#                         "username": row[3],
-#                         "email": row[4],
-#                         "is_admin": row[5],
-#                         "created_at": row[6],
-#                     }
-#                     for row in result
-#                 ]
-#         finally:
-#             self.release_connection(conn)
-
-#     def get_all_users_paginated(self, page: int = 1, page_size: int = 10):
-#         query_total = "SELECT COUNT(*) FROM users WHERE is_admin = FALSE"
-#         query_data = """
-#             SELECT id, first_name, last_name, username, email, is_admin, created_at
-#             FROM users
-#             -- WHERE is_admin = FALSE
-#             ORDER BY created_at DESC
-#             LIMIT %s OFFSET %s
-#         """
-
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor() as cursor:
-#                 # Total user count
-#                 cursor.execute(query_total)
-#                 total_users = cursor.fetchone()[0]
-
-#                 # Paginated data
-#                 offset = (page - 1) * page_size
-#                 cursor.execute(query_data, (page_size, offset))
-#                 rows = cursor.fetchall()
-
-#                 users = [
-#                     {
-#                         "id": row[0],
-#                         # "first_name": row[1],
-#                         # "last_name": row[2],
-#                         "username": row[3],
-#                         "email": row[4],
-#                         "is_admin": row[5],
-#                         "created_at": row[6],
-#                     }
-#                     for row in rows
-#                 ]
-
-#             return {
-#                 "users": users,
-#                 "total": total_users
-#             }
-
-#         except Exception as e:
-#             print(f"Error fetching paginated users: {e}")
-#             return {"users": [], "total": 0}
-#         finally:
-#             self.release_connection(conn)
-
-
-#     # ================================ call history logic ==================================
-
-#     # def insert_call_history(
-#     #     self,
-#     #     user_id: int,
-#     #     call_id: str,
-#     #     status: str = None,
-#     #     duration: int = None,
-#     #     transcript: dict = None,
-#     #     summary: str = None,
-#     #     recording_url: str = None,
-#     #     created_at: str = None,
-#     #     started_at: str = None,
-#     #     ended_at: str = None,
-#     #     voice_id: str = None,
-#     #     voice_name: str = None,
-#     #     from_number: str = None,
-#     #     to_number: str = None
-#     # ):
-#     #     """
-#     #     Insert a new call history record into the database.
-#     #     """
-#     #     conn = self.get_connection()
-#     #     try:
-#     #         with conn.cursor() as cursor:
-#     #             values = (
-#     #                 user_id, call_id, status, duration,
-#     #                 json.dumps(transcript) if transcript else None,
-#     #                 summary, recording_url,
-#     #                 created_at, started_at, ended_at,
-#     #                 voice_id, voice_name,
-#     #                 from_number, to_number
-#     #             )
-
-#     #             # Debug log
-#     #             logging.debug(f"Inserting call_history with values: {values}")
-
-#     #             cursor.execute("""
-#     #                 INSERT INTO call_history (
-#     #                     user_id, call_id, status, duration, transcript, summary,
-#     #                     recording_url, created_at, started_at, ended_at,
-#     #                     voice_id, voice_name,
-#     #                     from_number, to_number
-#     #                 )
-#     #                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-#     #                 RETURNING id;
-#     #             """, values)
-
-#     #             row = cursor.fetchone()
-#     #             conn.commit()
-
-#     #             if not row:
-#     #                 logging.error("Insert returned no row (check schema/columns)")
-#     #                 return None
-
-#     #             return row[0]
-
-#     #     except Exception as e:
-#     #         logging.error(f"Error inserting call history: {e}")
-#     #         conn.rollback()
-#     #         raise
-#     #     finally:
-#     #         self.release_connection(conn)
-
-#     def insert_call_history(
-#         self, user_id: int, call_id: str, status: str,
-#         voice_id: str, voice_name: str, to_number: str
-#     ):
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor() as cursor:
-#                 cursor.execute("""
-#                     INSERT INTO call_history (
-#                         user_id, call_id, status,
-#                         voice_id, voice_name, to_number, created_at
-#                     )
-#                     VALUES (%s,%s,%s,%s,%s,%s,NOW())
-#                     RETURNING id;
-#                 """, (user_id, call_id, status, voice_id, voice_name, to_number))
-#                 row = cursor.fetchone()
-#                 conn.commit()
-#                 return row[0]
-#         except Exception as e:
-#             logging.error(f"Error inserting call history: {e}")
-#             conn.rollback()
-#             raise
-#         finally:
-#             self.release_connection(conn)
-
-
-#     def get_call_history_by_user_id(self, user_id: int):
-#         """
-#         Fetch call history for a user (with JOIN on users table).
-#         Includes call details, voice info, caller/callee numbers, and timestamps.
-#         """
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
-#                 cursor.execute("""
-#                     SELECT ch.id, ch.call_id, ch.status, ch.duration, ch.transcript,
-#                         ch.summary, ch.recording_url, ch.created_at, ch.started_at, ch.ended_at,
-#                         ch.voice_id, ch.voice_name, ch.from_number, ch.to_number,
-#                         u.id AS user_id, u.username, u.email
-#                     FROM call_history ch
-#                     JOIN users u ON ch.user_id = u.id
-#                     WHERE ch.user_id = %s
-#                     ORDER BY ch.created_at DESC
-#                 """, (user_id,))
-                
-#                 rows = cursor.fetchall()
-
-#                 # Convert transcript from string to JSON if needed
-#                 for row in rows:
-#                     if isinstance(row["transcript"], str):
-#                         try:
-#                             row["transcript"] = json.loads(row["transcript"])
-#                         except Exception:
-#                             logging.warning(f"Invalid JSON in transcript for call_id={row['call_id']}")
-                
-#                 return rows
-
-#         except Exception as e:
-#             logging.error(f"Error fetching call history for user_id={user_id}: {e}")
-#             raise
-#         finally:
-#             self.release_connection(conn)
+    # Add to your PGDB class in db.py
+
+    def create_contacts_table(self):
+        """Create contacts table with proper constraints"""
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS contacts (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        first_name VARCHAR(100),
+                        last_name VARCHAR(100),
+                        phone_number VARCHAR(50) NOT NULL,
+                        email VARCHAR(255),
+                        call_status VARCHAR(50) DEFAULT 'pending',
+                        uploaded_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(user_id, phone_number)  -- Prevent duplicate phone numbers per user
+                    );
                     
+                    CREATE INDEX IF NOT EXISTS idx_contacts_user_id ON contacts(user_id);
+                    CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts(phone_number);
+                """)
+            conn.commit()
+            logging.info("✅ contacts table created/updated")
+        except Exception as e:
+            logging.error(f"Error creating contacts table: {e}")
+        finally:
+            self.release_connection(conn)
 
-#     # def update_call_status(self, call_id: str, status: str):
-#     #     conn = self.get_connection()
-#     #     try:
-#     #         with conn.cursor() as cursor:
-#     #             cursor.execute("""
-#     #                 UPDATE call_history
-#     #                 SET status = %s, updated_at = CURRENT_TIMESTAMP
-#     #                 WHERE call_id = %s
-#     #             """, (status, call_id))
-#     #         conn.commit()
-#     #     except Exception as e:
-#     #         logging.error(f"Error updating call status: {e}")
-#     #         conn.rollback()
-#     #         raise
-#     #     finally:
-#     #         self.release_connection(conn)
+    def get_contacts_simple(self, user_id: int) -> List[Dict]:
+            """
+            Get all contacts for a user (name + phone only, for quick frontend display)
+            No pagination - returns all contacts
+            
+            Returns:
+                List of dicts with: id, name, phone_number
+            """
+            conn = self.get_connection()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT id, first_name, last_name, phone_number, call_status
+                        FROM contacts
+                        WHERE user_id = %s
+                        ORDER BY uploaded_at DESC
+                    """, (user_id,))
+                    
+                    rows = cursor.fetchall()
+                    
+                    return [
+                        {
+                            "id": row[0],
+                            "name": f"{row[1] or ''} {row[2] or ''}".strip() or "Unknown",
+                            "phone_number": row[3],
+                            "call_status": row[4]
+                        }
+                        for row in rows
+                    ]
+                    
+            except Exception as e:
+                logging.error(f"Error getting contacts (simple): {e}")
+                raise
+            finally:
+                self.release_connection(conn)
+
+    def save_contacts_bulk(self, user_id: int, contacts: list) -> dict:
+        """
+        Fast bulk insert using execute_values (fastest method for PostgreSQL)
+        """
+        from psycopg2.extras import execute_values
+        
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                # Prepare data
+                values = [
+                    (
+                        user_id,
+                        contact.get("first_name", "")[:100],
+                        contact.get("last_name", "")[:100],
+                        contact.get("phone_number", "").strip(),
+                        contact.get("email") if contact.get("email") else None
+                    )
+                    for contact in contacts
+                    if contact.get("phone_number", "").strip()
+                ]
+                
+                if not values:
+                    return {"inserted": 0, "duplicates": 0, "errors": 0}
+                
+                # Fast bulk insert using execute_values
+                execute_values(
+                    cursor,
+                    """
+                    INSERT INTO contacts (user_id, first_name, last_name, phone_number, email)
+                    VALUES %s
+                    ON CONFLICT (user_id, phone_number) DO NOTHING
+                    """,
+                    values,
+                    page_size=1000  # Insert 1000 rows at a time
+                )
+                
+                # Get count of actually inserted rows
+                cursor.execute("""
+                    SELECT COUNT(*) FROM contacts 
+                    WHERE user_id = %s AND uploaded_at >= NOW() - INTERVAL '10 seconds'
+                """, (user_id,))
+                
+                inserted = cursor.fetchone()[0]
+                
+            conn.commit()
+            
+            duplicates = len(values) - inserted
+            
+            logging.info(f"✅ Bulk insert: {inserted} inserted, {duplicates} duplicates")
+            
+            return {
+                "inserted": inserted,
+                "duplicates": duplicates,
+                "errors": 0
+            }
+            
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Bulk insert error: {e}")
+            traceback.print_exc()
+            raise
+        finally:
+            self.release_connection(conn)
 
 
-#     # def update_call_status(self, call_id: str, status: str):
-#     #     conn = self.get_connection()
-#     #     try:
-#     #         with conn.cursor() as cursor:
-#     #             cursor.execute("""
-#     #                 UPDATE call_history
-#     #                 SET status = %s, updated_at = NOW()
-#     #                 WHERE call_id = %s
-#     #             """, (status, call_id))
-#     #         conn.commit()
-#     #     except Exception as e:
-#     #         logging.error(f"Error updating call status: {e}")
-#     #         conn.rollback()
-#     #         raise
-#     #     finally:
-#     #         self.release_connection(conn)
-
-#     def update_call_status(self, call_id: str, status: str):
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor() as cursor:
-#                 cursor.execute("""
-#                     UPDATE call_history
-#                     SET status = %s
-#                     WHERE call_id = %s
-#                 """, (status, call_id))
-#             conn.commit()
-#         except Exception as e:
-#             logging.error(f"Error updating call status: {e}")
-#             conn.rollback()
-#             raise
-#         finally:
-#             self.release_connection(conn)
 
 
 
-#     # def update_call_details(
-#     #     self, call_id: str, status: str, duration: float,
-#     #     summary: str, transcript: list, recording_url: str,
-#     #     started_at: str, ended_at: str, from_number: str
-#     # ):
-#     #     conn = self.get_connection()
-#     #     try:
-#     #         with conn.cursor() as cursor:
-#     #             cursor.execute("""
-#     #                 UPDATE call_history
-#     #                 SET status=%s, duration=%s, summary=%s, transcript=%s,
-#     #                     recording_url=%s, started_at=%s, ended_at=%s,
-#     #                     from_number=%s, updated_at=NOW()
-#     #                 WHERE call_id=%s
-#     #             """, (
-#     #                 status, duration, summary,
-#     #                 json.dumps(transcript) if transcript else None,
-#     #                 recording_url, started_at, ended_at, from_number, call_id
-#     #             ))
-#     #         conn.commit()
-#     #     except Exception as e:
-#     #         logging.error(f"Error updating call details: {e}")
-#     #         conn.rollback()
-#     #         raise
-#     #     finally:
-#     #         self.release_connection(conn)
 
-#     def update_call_details(
-#         self, call_id: str, status: str, duration: int,
-#         summary: str, transcript: list, recording_url: str,
-#         started_at: str, ended_at: str, from_number: str, to_number: str
-#     ):
-#         conn = self.get_connection()
-#         try:
-#             with conn.cursor() as cursor:
-#                 cursor.execute("""
-#                     UPDATE call_history
-#                     SET status=%s,
-#                         duration=%s,
-#                         summary=%s,
-#                         transcript=%s,
-#                         recording_url=%s,
-#                         started_at=%s,
-#                         ended_at=%s,
-#                         from_number=%s,
-#                         to_number=%s
-#                     WHERE call_id=%s
-#                 """, (
-#                     status, duration, summary,
-#                     json.dumps(transcript) if transcript else None,
-#                     recording_url, started_at, ended_at,
-#                     from_number, to_number, call_id
-#                 ))
-#             conn.commit()
-#         except Exception as e:
-#             logging.error(f"Error updating call details: {e}")
-#             conn.rollback()
-#             raise
-#         finally:
-#             self.release_connection(conn)
+
+
+
+
+
+
