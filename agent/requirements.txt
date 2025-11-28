@@ -10,3 +10,4 @@ google-auth==2.35.0
 httpx
 requests
 tenacity
+boto3

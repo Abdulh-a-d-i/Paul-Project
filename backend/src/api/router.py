@@ -35,14 +35,20 @@ from src.api.base_models import (
     ContactsListResponse,
     ContactUploadResponse,
     ContactUploadResponse,
-    ContactUploadStats
+    ContactUploadStats,
+    BulkCallResponse,
+    PromptResponse,
+    UpdatePromptRequest,
+    CreatePromptRequest,
+    SingleCallPayload,
+    BulkCallPayload
 )
-from src.models.System_Prompt import SystemPromptBuilder
 from src.utils.db import PGDB 
 from src.utils.mail_management import Send_Mail
 from src.utils.jwt_utils import create_access_token
-from src.utils.utils import get_current_user,add_call_event, get_livekit_call_status,fetch_and_store_transcript,fetch_and_store_recording, calculate_duration, check_if_answered
+from src.utils.utils import get_current_user,add_call_event, generate_presigned_url,fetch_and_store_transcript,fetch_and_store_recording, calculate_duration, check_if_answered
 from livekit import api
+from src.models.System_Prompt import PromptBuilder
 import csv
 load_dotenv()
 
@@ -51,9 +57,10 @@ mail_obj = Send_Mail()
 db = PGDB()
 load_dotenv(override=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GCS_BUCKET_NAME = os.getenv("GOOGLE_BUCKET_NAME")
-GCS_SERVICE_ACCOUNT_KEY = os.getenv("GCS_SERVICE_ACCOUNT_KEY")  
-
+AWS_BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 # error response 
 def error_response(message, status_code=400):
@@ -111,242 +118,272 @@ def login_user(user: UserLogin):
 
 
 voices = {
-    # English voices
-    "david":"tNIuvXGG5RnGdTbvfnPR", # "1SM7GgM6IMuvQlz2BwM3",
-    "ravi": "lyPbHf3pO5t4kYZYenaY", # indian ancent
-    "emily-british": "pjcYQlDFKMbcOUp6F5GD", #"9YWmufCrZ2agGoSoVL8je",
-    "alice-british": "uYXf8XasLslADfZ2MB4u", #"XcXEQzuLXRU9RcfWzEJt",
-    "julia-british": "MzqUf1HbJ8UmQ0wUsx2p", #"ZtcPZrt9K4w8e1OB9M6w",
-    
-    # Spanish voices
-    "julio": "KH1SQLVulwP6uG4O3nmT", #"A7AUsa1uITCDpK29MG3m", 
-    "donato": "UgBBYS2sOqTuMpoF3BR0", #"851ejYcv2BoNPjrkw93G",
-    "helena-spanish": "aTxZrSrp47xsP6Ot4Kgd", #"5vkxOzoz40FrElmLP4P7",
-    "rosa": "TgnhEILA8UwUqIMi20rp", #"BIvP0GN1cAtSRTxNHnWS",
-    "mariam": "1ea3IFhmSWgw8sJkSvfJ", #"90ipbRoKi4CpHXvKVtl0",
+    "sam elliott":"1Le150XwaOV6DjrgvGiL",
+    "peck":"KP0g0tgE6czKXsf2vmF6",
+    "king":"1WVD88RnPY0xX4bYTFi4",
+    "barry white":"sydt9eVyT7wySiR0Mcpo",
+    "smokey burt":"M7z5dT9mmYi8BD8PhjLd",
+    "dark blues singer":"FMUdRwz26PiAESHyfVut",
+    "wyatt":"YXpFCvM1S3JbWEJhoskW",
+    "southern mike":"DwEFbvGTcJhAk9eY9m0f",
+    "serafina":"4tRn1lSkEn13EVTuqb0g",
+    "paul":"6677dBjGbnngilI0IDYQ"
 }
 
-@router.post("/assistant-initiate-call")
-async def make_call_with_livekit(payload: Assistant_Payload, user=Depends(get_current_user)):
+@router.post("/assistant-bulk-call")
+async def make_bulk_calls_with_livekit(
+    payload: BulkCallPayload,
+    user=Depends(get_current_user)
+):
+    
     try:
-        room_name = f"call-{user['id']}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        
-        #  Get voice_id from payload.voice name
-        voice_name = getattr(payload, "voice", "david").lower()  # Default to 'david'
+        # Get voice_id from voice name
+        voice_name = payload.voice.lower()
         voice_id = voices.get(voice_name)
         
         if not voice_id:
-            logging.warning(f" Unknown voice '{voice_name}', using default 'david'")
-            voice_id = voices["david"]
-            voice_name = "david"
+            logging.warning(f"Unknown voice '{voice_name}', using default 'david'")
+            voice_id = voices["Paul"]
+            voice_name = "Paul"
         
-        #  Get language from payload (default to 'en')
-        language = getattr(payload, "language", "en").lower()
+        # Validate language
+        language = payload.language.lower()
         if language not in ["en", "es"]:
-            logging.warning(f" Unknown language '{language}', defaulting to 'en'")
+            logging.warning(f"Unknown language '{language}', defaulting to 'en'")
             language = "en"
         
-        logging.info(f" Using voice: {voice_name} (ID: {voice_id}), Language: {language}")
+        logging.info(f" Bulk call: voice={voice_name}, language={language}")
+        logging.info(f" Calling {len(payload.phone_numbers)} numbers")
         
-        #  STEP 1: Get user's custom prompt from DB
-        user_prompt_data = db.get_user_prompt(user["id"])
-        
-        if not user_prompt_data:
-            return error_response("User prompt not found", status_code=404)
-        
-        base_prompt = user_prompt_data["system_prompt"]
-        
-        #  STEP 2: Build complete system prompt
-        prompt_builder = SystemPromptBuilder(
-            base_prompt=base_prompt,
-            caller_name=payload.caller_name,
-            caller_email=payload.caller_email,
-            call_context=payload.context,
-            language=language  
+        build_system_prompt = PromptBuilder()
 
-        )
+        system_prompt = build_system_prompt.generate_complete_prompt(payload.system_prompt)
         
-        complete_system_prompt = prompt_builder.generate_complete_prompt()
+        logging.info(f"📝 Using provided system prompt ({len(system_prompt)} chars)")
         
-        logging.info(f" Built system prompt ({len(complete_system_prompt)} chars)")
+        initiated_calls = []
+        failed_calls = []
         
-        #  STEP 3: Prepare metadata with complete prompt + voice + language
-        metadata = {
-            "phone_number": payload.outbound_number,
-            "call_context": payload.context,
-            "user_id": user["id"],
-            "caller_name": payload.caller_name,
-            # "caller_email": payload.caller_email,
-            "caller_email": user["email"],#payload.caller_email,
-            "system_prompt": complete_system_prompt,
-            "agent_name": "PAUL",
-            "voice_id": voice_id,        
-            "voice_name": voice_name,    
-            "language": language         
-        }
-        print("\n\n")
-        print(metadata)
-        print("\n\n")
-
-        #  STEP 4: Create DB record
-        db.insert_call_history(
-            user_id=user["id"],
-            call_id=room_name,
-            status="initiated",
-            to_number=payload.outbound_number,
-            voice_name=voice_name,  
-        )
-        logging.info(f" Created call record: {room_name}")
-
-        add_call_event(room_name, "call_initiated", {"user_id": user["id"]})
-
-        async with api.LiveKitAPI(
-            url=os.getenv("LIVEKIT_URL", "").replace("wss://", "https://"),
-            api_key=os.getenv("LIVEKIT_API_KEY"),
-            api_secret=os.getenv("LIVEKIT_API_SECRET"),
-        ) as lkapi:
-            dispatch = await lkapi.agent_dispatch.create_dispatch(
-                api.CreateAgentDispatchRequest(
-                    agent_name="outbound-caller",
-                    room=room_name,
-                    metadata=json.dumps(metadata),
-                )
-            )
-
-        logging.info(f" Agent dispatched: {dispatch.id}")
-
-        return JSONResponse({
-            "success": True,
-            "call_id": room_name,
-            "dispatch_id": dispatch.id,
-            "voice": voice_name,
-            "language": language,
-            "message": "Call initiated successfully"
-        })
-        
-    except Exception as e:
-        logging.error(f"Error initiating LiveKit call: {e}")
-        traceback.print_exc()
-        
-        if 'room_name' in locals():
+        for phone_number in payload.phone_numbers:
             try:
-                db.update_call_history(
+                # Generate unique room name for this call
+                timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+                room_name = f"call-{user['id']}-{phone_number.replace('+', '').replace('-', '')}-{timestamp}"
+                
+                # Prepare metadata for this specific call
+                metadata = {
+                    "phone_number": phone_number,
+                    # "call_context": payload.context,
+                    "user_id": user["id"],
+                    "caller_name": payload.caller_name,
+                    "caller_email": user["email"],
+                    "system_prompt": system_prompt,  # Use provided prompt
+                    "agent_name": "PAUL",
+                    "voice_id": voice_id,
+                    "voice_name": voice_name,
+                    "language": language
+                }
+                
+                logging.info(f"📞 Initiating call to {phone_number} (room: {room_name})")
+                
+                # Create DB record
+                db.insert_call_history(
+                    user_id=user["id"],
                     call_id=room_name,
-                    updates={"status": "failed"}
+                    status="initiated",
+                    to_number=phone_number,
+                    voice_name=voice_name,
                 )
-            except:
-                pass
-        
-        raise HTTPException(status_code=500, detail=f"Failed to initiate call: {str(e)}")
-
-
-@router.post("/livekit-webhook")
-async def livekit_webhook(request: Request):
-    try:
-        data = await request.json()
-        event = data.get("event")
-        room = data.get("room", {})
-        call_id = room.get("name")
-
-        #  Extract call_id from egress events
-        if not call_id:
-            egress_info = data.get("egress_info", {}) or data.get("egressInfo", {})
-            call_id = egress_info.get("room_name") or egress_info.get("roomName")
-            if not call_id:
-                return JSONResponse({"message": "No call_id"})
-
-        #  Always log event
-        add_call_event(call_id, event, data)
-        
-        #  Ignore non-critical events
-        if event in ["room_started", "participant_joined", "egress_started", 
-                     "egress_updated", "track_published", "track_unpublished"]:
-            return JSONResponse({"message": f"{event} logged"})
-
-        #  Handle room end
-        if event in ["room_finished", "participant_left"]:
-            await asyncio.sleep(0.5)
-            
-            conn = db.get_connection()
-            try:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        SELECT status, events_log, started_at, created_at
-                        FROM call_history WHERE call_id = %s
-                    """, (call_id,))
-                    row = cursor.fetchone()
-            finally:
-                db.release_connection(conn)  #  FIXED: Changed from conn.close()
-
-            if not row:
-                return JSONResponse({"message": "Call not found"})
-
-            current_status, events_log, db_started_at, created_at = row
-            
-            #  Skip if already final
-            if current_status in {"completed", "unanswered"}:
-                # Just update duration
-                started = db_started_at or created_at
-                ended = datetime.now(timezone.utc)
-                duration = (ended - started).total_seconds() if started else 0
                 
-                db.update_call_history(call_id, {
-                    "duration": max(0, duration),
-                    "ended_at": ended
+                add_call_event(room_name, "call_initiated", {
+                    "user_id": user["id"],
+                    "phone_number": phone_number
                 })
-                return JSONResponse({"message": "Duration updated"})
-
-            #  Determine final status
-            previously_connected = current_status in {"connected", "completed"}
-
-            answered = check_if_answered(events_log)
-            if answered or previously_connected:
-                final_status = "completed"
-            else:
-                final_status = "unanswered"
-            
-            started = db_started_at or created_at
-            ended = datetime.now(timezone.utc)
-            duration = (ended - started).total_seconds() if (answered and started) else 0
-
-            db.update_call_history(call_id, {
-                "status": final_status,
-                "duration": max(0, duration),
-                "ended_at": ended,
-                "started_at": started
-            })
-            
-            return JSONResponse({"message": f"Call ended: {final_status}"})
-
-        #  Handle recording
-        elif event == "egress_ended":
-            egress_info = data.get("egress_info", {}) or data.get("egressInfo", {})
-            file_results = egress_info.get("file_results", []) or egress_info.get("fileResults", [])
-            
-            if file_results:
-                file_info = file_results[0] if isinstance(file_results, list) else file_results
-                location = file_info.get("location") or file_info.get("download_url")
                 
-                if location:
-                    db.update_call_history(call_id, {"recording_url": location})
-                    return JSONResponse({"message": "Recording saved"})
-
-        return JSONResponse({"message": f"{event} processed"})
-
+                # Dispatch agent to LiveKit
+                async with api.LiveKitAPI(
+                    url=os.getenv("LIVEKIT_URL", "").replace("wss://", "https://"),
+                    api_key=os.getenv("LIVEKIT_API_KEY"),
+                    api_secret=os.getenv("LIVEKIT_API_SECRET"),
+                ) as lkapi:
+                    dispatch = await lkapi.agent_dispatch.create_dispatch(
+                        api.CreateAgentDispatchRequest(
+                            agent_name="outbound-caller",
+                            room=room_name,
+                            metadata=json.dumps(metadata),
+                        )
+                    )
+                
+                logging.info(f"✅ Call to {phone_number} dispatched: {dispatch.id}")
+                
+                initiated_calls.append({
+                    "call_id": room_name,
+                    "phone_number": phone_number,
+                    "dispatch_id": dispatch.id,
+                    "voice": voice_name,
+                    "language": language
+                })
+                
+                # Small delay to avoid overwhelming LiveKit
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logging.error(f"❌ Failed to initiate call to {phone_number}: {e}")
+                traceback.print_exc()
+                
+                failed_calls.append({
+                    "phone_number": phone_number,
+                    "error": str(e)
+                })
+                
+                # Mark as failed in DB if room was created
+                if 'room_name' in locals():
+                    try:
+                        db.update_call_history(
+                            call_id=room_name,
+                            updates={"status": "failed"}
+                        )
+                    except:
+                        pass
+        
+        # Build response
+        response = {
+            "success": True,
+            "message": f"Initiated {len(initiated_calls)} of {len(payload.phone_numbers)} calls",
+            "total_calls": len(payload.phone_numbers),
+            "initiated_calls": initiated_calls,
+            "failed_calls": failed_calls
+        }
+        
+        logging.info(f"✅ Bulk call completed: {len(initiated_calls)} success, {len(failed_calls)} failed")
+        
+        return JSONResponse(response)
+        
     except Exception as e:
-        logging.error(f"Webhook error: {e}")
-        traceback.print_exc()  #  Added for better debugging
-        return JSONResponse({"error": str(e)}, status_code=500)
+        logging.error(f"❌ Bulk call error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Bulk call failed: {str(e)}")
 
+
+
+
+# @router.post("/assistant-initiate-call")
+# async def make_call_with_livekit(payload: Assistant_Payload, user=Depends(get_current_user)):
+#     try:
+#         room_name = f"call-{user['id']}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        
+#         #  Get voice_id from payload.voice name
+#         voice_name = getattr(payload, "voice", "david").lower()  # Default to 'david'
+#         voice_id = voices.get(voice_name)
+        
+#         if not voice_id:
+#             logging.warning(f" Unknown voice '{voice_name}', using default 'david'")
+#             voice_id = voices["david"]
+#             voice_name = "david"
+        
+#         #  Get language from payload (default to 'en')
+#         language = getattr(payload, "language", "en").lower()
+#         if language not in ["en", "es"]:
+#             logging.warning(f" Unknown language '{language}', defaulting to 'en'")
+#             language = "en"
+        
+#         logging.info(f" Using voice: {voice_name} (ID: {voice_id}), Language: {language}")
+        
+#         #  STEP 1: Get user's custom prompt from DB
+#         user_prompt_data = db.get_user_prompt(user["id"])
+        
+#         if not user_prompt_data:
+#             return error_response("User prompt not found", status_code=404)
+        
+#         base_prompt = user_prompt_data["system_prompt"]
+        
+#         #  STEP 2: Build complete system prompt
+#         prompt_builder = SystemPromptBuilder(
+#             base_prompt=base_prompt,
+#             caller_name=payload.caller_name,
+#             caller_email=payload.caller_email,
+#             call_context=payload.context,
+#             language=language  
+
+#         )
+        
+#         complete_system_prompt = prompt_builder.generate_complete_prompt()
+        
+#         logging.info(f" Built system prompt ({len(complete_system_prompt)} chars)")
+        
+#         #  STEP 3: Prepare metadata with complete prompt + voice + language
+#         metadata = {
+#             "phone_number": payload.outbound_number,
+#             "call_context": payload.context,
+#             "user_id": user["id"],
+#             "caller_name": payload.caller_name,
+#             # "caller_email": payload.caller_email,
+#             "caller_email": user["email"],#payload.caller_email,
+#             "system_prompt": complete_system_prompt,
+#             "agent_name": "PAUL",
+#             "voice_id": voice_id,        
+#             "voice_name": voice_name,    
+#             "language": language         
+#         }
+#         print("\n\n")
+#         print(metadata)
+#         print("\n\n")
+
+#         #  STEP 4: Create DB record
+#         db.insert_call_history(
+#             user_id=user["id"],
+#             call_id=room_name,
+#             status="initiated",
+#             to_number=payload.outbound_number,
+#             voice_name=voice_name,  
+#         )
+#         logging.info(f" Created call record: {room_name}")
+
+#         add_call_event(room_name, "call_initiated", {"user_id": user["id"]})
+
+#         async with api.LiveKitAPI(
+#             url=os.getenv("LIVEKIT_URL", "").replace("wss://", "https://"),
+#             api_key=os.getenv("LIVEKIT_API_KEY"),
+#             api_secret=os.getenv("LIVEKIT_API_SECRET"),
+#         ) as lkapi:
+#             dispatch = await lkapi.agent_dispatch.create_dispatch(
+#                 api.CreateAgentDispatchRequest(
+#                     agent_name="outbound-caller",
+#                     room=room_name,
+#                     metadata=json.dumps(metadata),
+#                 )
+#             )
+
+#         logging.info(f" Agent dispatched: {dispatch.id}")
+
+#         return JSONResponse({
+#             "success": True,
+#             "call_id": room_name,
+#             "dispatch_id": dispatch.id,
+#             "voice": voice_name,
+#             "language": language,
+#             "message": "Call initiated successfully"
+#         })
+        
+#     except Exception as e:
+#         logging.error(f"Error initiating LiveKit call: {e}")
+#         traceback.print_exc()
+        
+#         if 'room_name' in locals():
+#             try:
+#                 db.update_call_history(
+#                     call_id=room_name,
+#                     updates={"status": "failed"}
+#                 )
+#             except:
+#                 pass
+        
+#         raise HTTPException(status_code=500, detail=f"Failed to initiate call: {str(e)}"
 
 
     
 
 
-@router.post("/livekit-egress-webhook")
-async def livekit_egress_webhook(request: Request):
-    """Alias endpoint for egress-specific webhooks"""
-    return await livekit_webhook(request)
 
 
 # @router.get("/call-history")
@@ -423,78 +460,7 @@ async def livekit_egress_webhook(request: Request):
 # In routes.py - Update get_call_status endpoint
 
 
-@router.get("/call-status/{call_id}")
-async def get_call_status(call_id: str):
-    """Optimized status check with proper connection handling"""
-    try:
-        conn = db.get_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT status, created_at, ended_at, duration, started_at
-                    FROM call_history 
-                    WHERE call_id = %s
-                """, (call_id,))
-                row = cursor.fetchone()
-        finally:
-            db.release_connection(conn)  #  FIXED: Was conn.close()
-        
-        if not row:
-            return JSONResponse(
-                status_code=404,
-                content={"status": "not_found", "is_final": True}
-            )
-        
-        current_status, created_at, ended_at, duration, started_at = row
-        
-        #  Normalize status
-        if current_status not in {"initialized", "dialing", "connected", "completed", "unanswered"}:
-            STATUS_MAP = {
-                "initiated": "initialized",
-                "in_progress": "connected",
-                "failed": "unanswered",
-                "not_attended": "unanswered"
-            }
-            current_status = STATUS_MAP.get(current_status, "initialized")
-        
-        # Calculate elapsed time
-        time_elapsed = 0
-        if created_at:
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-            time_elapsed = (datetime.now(timezone.utc) - created_at).total_seconds()
-        
-        is_final = current_status in {"completed", "unanswered"}
-        
-        response = {
-            "status": current_status,
-            "message": {
-                "initialized": "Initializing...",
-                "dialing": "Dialing...",
-                "connected": "Call in progress",
-                "completed": "Call completed",
-                "unanswered": "Call not answered"
-            }.get(current_status, current_status),
-            "time_elapsed": round(time_elapsed, 1),
-            "is_final": is_final
-        }
-        
-        if is_final and duration:
-            response["duration"] = round(duration, 1)
-        
-        if started_at:
-            response["started_at"] = started_at.isoformat()
-        if ended_at:
-            response["ended_at"] = ended_at.isoformat()
-        
-        return JSONResponse(response)
-        
-    except Exception as e:
-        logging.error(f"get_call_status error: {e}")
-        return JSONResponse(
-            {"status": "error", "message": str(e), "is_final": True},
-            status_code=500
-        )
+
                             
 
 @router.get("/call-history")
@@ -549,8 +515,15 @@ async def get_user_call_history(
             
             call_data["transcript_text"] = transcript_text
             
-            #  FIX 3: Add recording availability flag
-            call_data["has_recording"] = bool(call.get("recording_url") or call.get("recording_blob_data"))
+            call_data["has_recording"] = bool(call.get("recording_blob"))
+            if call.get("recording_blob"):
+                presigned_url = generate_presigned_url(call["recording_blob"], expiration=3600)
+                call_data["recording_presigned_url"] = presigned_url
+            else:
+                call_data["recording_presigned_url"] = None
+            
+            calls.append(call_data)
+
             
             calls.append(call_data)
 
@@ -721,10 +694,9 @@ async def save_call_data(request: Request):
         data = await request.json()
         
         call_id = data.get("call_id")
-        transcript_blob = data.get("transcript_blob")
-        recording_blob = data.get("recording_blob")
+        transcript_blob = data.get("transcript_blob")  # S3 key
+        recording_blob = data.get("recording_blob")    # S3 key
         
-        # Save metadata
         updates = {
             "transcript_blob": transcript_blob,
             "recording_blob": recording_blob
@@ -732,21 +704,14 @@ async def save_call_data(request: Request):
         
         db.update_call_history(call_id, updates)
         
-        #  DELAYED transcript (5s)
+        # Download from S3 (delayed)
         if transcript_blob:
             async def delayed_transcript():
                 await asyncio.sleep(5)
-                logging.info(f"📄 Downloading transcript for {call_id}")
+                logging.info(f"📄 Downloading transcript from S3")
                 await fetch_and_store_transcript(call_id, None, transcript_blob)
             asyncio.create_task(delayed_transcript())
         
-        #  DELAYED recording (15s)
-        if recording_blob:
-            async def delayed_recording():
-                await asyncio.sleep(15)
-                logging.info(f"🎵 Downloading recording for {call_id}")
-                await fetch_and_store_recording(call_id, None, recording_blob)
-            asyncio.create_task(delayed_recording())
         
         return JSONResponse({"success": True})
         
@@ -757,53 +722,7 @@ async def save_call_data(request: Request):
 
 
 
-@router.post("/agent/report-event")
-async def receive_agent_event(request: Request):
-    try:
-        data = await request.json()
-        
-        call_id = data.get("call_id")
-        status = data.get("status")
-        timestamp = data.get("timestamp")
-        
-        if not call_id or not status:
-            return JSONResponse({"error": "Missing data"}, status_code=400)
-        
-        if status not in {"initialized", "dialing", "connected", "unanswered"}:
-            return JSONResponse({"error": "Invalid status"}, status_code=400)
-        
-        #  Build updates
-        updates = {"status": status}
-        now = datetime.now(timezone.utc)
-        
-        #  Set started_at on dialing or connected
-        if status in {"dialing", "connected"}:
-            conn = db.get_connection()
-            try:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT started_at FROM call_history WHERE call_id = %s",
-                        (call_id,)
-                    )
-                    row = cursor.fetchone()
-                    if row and not row[0]:
-                        updates["started_at"] = now
-            finally:
-                # conn.close()
-                db.release_connection(conn)
-        
-        #  Handle unanswered
-        if status == "unanswered":
-            updates["ended_at"] = now
-            updates["duration"] = 0
-        
-        db.update_call_history(call_id, updates)
-        
-        return JSONResponse({"success": True})
-        
-    except Exception as e:
-        logging.error(f"report-event error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+
     
 
 
@@ -816,189 +735,274 @@ async def receive_agent_event(request: Request):
 
 
 
-@router.get("/prompt-customization")
-async def get_prompt_customization(user=Depends(get_current_user)):
-    """
-    Get the user's complete system prompt as plain text.
-    No field parsing - returns exactly what's stored.
-    """
-    try:
-        prompt_data = db.get_user_prompt(user["id"])
-        
-        if not prompt_data:
-            return error_response("Prompt not found", status_code=404)
-        
-        # Just return the system_prompt field directly
-        return JSONResponse(content=jsonable_encoder({
-            "success": True,
-            "system_prompt": prompt_data["system_prompt"],  # Single field from DB
-            "updated_at": prompt_data["updated_at"]
-        }))
-        
-    except Exception as e:
-        logging.error(f"Error fetching prompt customization: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.put("/prompt-customization")
-async def update_prompt_customization(
-    customization: PromptCustomizationUpdate,
+@router.post("/prompts")
+async def create_prompt(
+    request: Request,
     user=Depends(get_current_user)
 ):
     """
-    Update user's system prompt.
-    Stores exactly what user sends - no parsing.
+    Create a new named prompt.
+    
+    Body:
+    {
+        "prompt_name": "Sales Call Script",
+        "system_prompt": "You are a sales assistant..."
+    }
     """
     try:
-        prompt_text = customization.system_prompt.strip()
+        data = await request.json()
         
-        if not prompt_text:
-            return error_response("System prompt cannot be empty", status_code=400)
+        prompt_name = data.get("prompt_name", "").strip()
+        system_prompt = data.get("system_prompt", "").strip()
         
-        # Just update the single system_prompt field
-        updated_prompt = db.update_user_system_prompt(
-            user_id=user["id"],
-            system_prompt=prompt_text  # Store as-is
-        )
+        if not prompt_name:
+            return error_response("prompt_name is required", status_code=400)
         
-        if not updated_prompt:
-            return error_response("Failed to update customization", status_code=500)
+        if not system_prompt:
+            return error_response("system_prompt is required", status_code=400)
+        
+        if len(prompt_name) > 255:
+            return error_response("prompt_name too long (max 255 chars)", status_code=400)
+        
+        result = db.create_prompt(user["id"], prompt_name, system_prompt)
         
         return JSONResponse(content=jsonable_encoder({
             "success": True,
-            "message": "Prompt customization updated successfully",
-            "system_prompt": updated_prompt["system_prompt"],
-            "updated_at": updated_prompt["updated_at"]
-        }))
+            "message": "Prompt created successfully",
+            "prompt": result
+        }), status_code=201)
         
+    except ValueError as ve:
+        return error_response(str(ve), status_code=400)
     except Exception as e:
-        logging.error(f"Error updating prompt customization: {e}")
+        logging.error(f"Error creating prompt: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/prompt-customization/reset")
-async def reset_prompt_customization(user=Depends(get_current_user)):
+@router.get("/prompts")
+async def get_all_prompts(user=Depends(get_current_user)):
     """
-    Reset user's system prompt to default text.
+    Get all prompts for the current user with names and content.
+    
+    Returns:
+    {
+        "success": true,
+        "prompts": [
+            {
+                "id": 1,
+                "prompt_name": "Default Prompt",
+                "system_prompt": "...",
+                "is_default": true,
+                "created_at": "...",
+                "updated_at": "..."
+            },
+            ...
+        ]
+    }
     """
     try:
-        reset_prompt = db.reset_user_prompt_to_default(user["id"])
-        
-        if not reset_prompt:
-            return error_response("Failed to reset customization", status_code=500)
+        prompts = db.get_all_user_prompts(user["id"])
         
         return JSONResponse(content=jsonable_encoder({
             "success": True,
-            "message": "Prompt customization reset to defaults",
-            "system_prompt": reset_prompt["system_prompt"],  # Default text
-            "updated_at": reset_prompt["updated_at"]
+            "count": len(prompts),
+            "prompts": prompts
         }))
         
     except Exception as e:
-        logging.error(f"Error resetting prompt customization: {e}")
+        logging.error(f"Error fetching prompts: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.options("/calls/{call_id}/recording/stream")
-async def stream_call_recording_options(call_id: str):
-    return Response(
-        status_code=200,
-        headers={
-            "Access-Control-Allow-Origin": "*",  # Or specific domain
-            "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Allow-Headers": "Range, Content-Type, Authorization, Accept",
-            "Access-Control-Max-Age": "3600"
-        }
-    )
 
-@router.get("/calls/{call_id}/recording/stream")
-async def stream_call_recording(
-    call_id: str, 
-    user=Depends(get_current_user),
-    request: Request = None
+@router.get("/prompts/{prompt_id}")
+async def get_prompt_by_id(
+    prompt_id: int,
+    user=Depends(get_current_user)
 ):
+    """
+    Get a specific prompt by ID.
+    """
     try:
-        recording_data, content_type, size = db.get_recording_blob(call_id, user["id"])
+        prompt = db.get_prompt_by_id(user["id"], prompt_id)
         
-        if recording_data:
-            logging.info(f" Streaming {size} bytes for {call_id}")
-            
-            cors_headers = {
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, OPTIONS",
-                "Access-Control-Allow-Headers": "Range, Content-Type, Authorization",
-                "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
-            }
-            
-            range_header = request.headers.get("range") if request else None
-            
-            if range_header:
-                try:
-                    range_match = range_header.replace("bytes=", "").split("-")
-                    start = int(range_match[0]) if range_match[0] else 0
-                    end = int(range_match[1]) if len(range_match) > 1 and range_match[1].strip() else size - 1
-                    
-                    # Ensure valid range
-                    start = max(0, start)
-                    end = min(end, size - 1)
-                    
-                    chunk = recording_data[start:end + 1]
-                    
-                    return Response(
-                        content=chunk,
-                        status_code=206,
-                        media_type=content_type or "audio/ogg",
-                        headers={
-                            **cors_headers,
-                            "Content-Range": f"bytes {start}-{end}/{size}",
-                            "Content-Length": str(len(chunk)),
-                            "Accept-Ranges": "bytes",
-                        }
-                    )
-                except Exception as e:
-                    logging.warning(f"Range parse failed: {e}")
-            
-            # Full file stream
-            return StreamingResponse(
-                io.BytesIO(recording_data),
-                media_type=content_type or "audio/ogg",
-                headers={
-                    **cors_headers,
-                    "Content-Length": str(size),
-                    "Accept-Ranges": "bytes",
-                }
-            )
+        if not prompt:
+            return error_response("Prompt not found", status_code=404)
         
-        # URL fallback...
-        raise HTTPException(status_code=404, detail="Recording not found")
+        return JSONResponse(content=jsonable_encoder({
+            "success": True,
+            "prompt": prompt
+        }))
         
     except Exception as e:
-        logging.error(f"❌ Error: {e}")
+        logging.error(f"Error fetching prompt: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/prompts/{prompt_id}")
+async def update_prompt(
+    prompt_id: int,
+    request: Request,
+    user=Depends(get_current_user)
+):
+    """
+    Update an existing prompt.
+    
+    Body (both optional, but at least one required):
+    {
+        "prompt_name": "Updated Name",
+        "system_prompt": "Updated prompt..."
+    }
+    """
+    try:
+        data = await request.json()
+        
+        prompt_name = data.get("prompt_name", "").strip() if "prompt_name" in data else None
+        system_prompt = data.get("system_prompt", "").strip() if "system_prompt" in data else None
+        
+        if prompt_name is not None and not prompt_name:
+            return error_response("prompt_name cannot be empty", status_code=400)
+        
+        if system_prompt is not None and not system_prompt:
+            return error_response("system_prompt cannot be empty", status_code=400)
+        
+        if prompt_name is None and system_prompt is None:
+            return error_response("At least one field must be provided", status_code=400)
+        
+        result = db.update_prompt(user["id"], prompt_id, prompt_name, system_prompt)
+        
+        return JSONResponse(content=jsonable_encoder({
+            "success": True,
+            "message": "Prompt updated successfully",
+            "prompt": result
+        }))
+        
+    except ValueError as ve:
+        return error_response(str(ve), status_code=400)
+    except Exception as e:
+        logging.error(f"Error updating prompt: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/prompts/{prompt_id}")
+async def delete_prompt(
+    prompt_id: int,
+    user=Depends(get_current_user)
+):
+    """
+    Delete a prompt (cannot delete default).
+    """
+    try:
+        db.delete_prompt(user["id"], prompt_id)
+        
+        return JSONResponse(content={
+            "success": True,
+            "message": "Prompt deleted successfully"
+        })
+        
+    except ValueError as ve:
+        return error_response(str(ve), status_code=400)
+    except Exception as e:
+        logging.error(f"Error deleting prompt: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/prompts/{prompt_id}/set-default")
+async def set_default_prompt(
+    prompt_id: int,
+    user=Depends(get_current_user)
+):
+    """
+    Set a prompt as the default.
+    """
+    try:
+        result = db.set_default_prompt(user["id"], prompt_id)
+        
+        return JSONResponse(content=jsonable_encoder({
+            "success": True,
+            "message": "Default prompt updated",
+            "prompt": result
+        }))
+        
+    except ValueError as ve:
+        return error_response(str(ve), status_code=400)
+    except Exception as e:
+        logging.error(f"Error setting default: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     
 
+@router.get("/calls/{call_id}/recording")
+async def get_call_recording_url(
+    call_id: str,
+    user=Depends(get_current_user)
+):
+    """
+    Get presigned URL for call recording (valid for 1 hour).
+    Recording is stored in S3, not in DB.
+    """
+    try:
+        
+        # Get recording blob path from DB
+        with db.conn() as (conn, cursor):
+            cursor.execute("""
+                SELECT recording_blob
+                FROM call_history
+                WHERE call_id = %s AND user_id = %s
+            """, (call_id, user["id"]))
+            row = cursor.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Call not found")
+        
+        recording_blob = row["recording_blob"] if isinstance(row, dict) else row[0]
+        
+        if not recording_blob:
+            raise HTTPException(status_code=404, detail="No recording available")
+        
+        # Generate presigned URL (valid for 1 hour)
+        presigned_url = generate_presigned_url(recording_blob, expiration=3600)
+        
+        if not presigned_url:
+            raise HTTPException(status_code=500, detail="Failed to generate download URL")
+        
+        return JSONResponse({
+            "success": True,
+            "recording_url": presigned_url,
+            "expires_in": 3600,
+            "call_id": call_id
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error getting recording URL: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+    
 @router.get("/calls/{call_id}/transcript")
 async def get_call_transcript(call_id: str, user=Depends(get_current_user)):
     """Get transcript for a specific call"""
     try:
-        conn = db.get_connection()
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT transcript
-                    FROM call_history
-                    WHERE call_id = %s AND user_id = %s
-                """, (call_id, user["id"]))
-                row = cursor.fetchone()
-        finally:
-            db.release_connection(conn)
+        # ✅ Use the context manager pattern
+        with db.conn() as (conn, cursor):
+            cursor.execute("""
+                SELECT transcript
+                FROM call_history
+                WHERE call_id = %s AND user_id = %s
+            """, (call_id, user["id"]))
+            row = cursor.fetchone()
         
-        if not row or not row[0]:
+        if not row or not row["transcript"]:
             raise HTTPException(status_code=404, detail="Transcript not found")
         
-        return JSONResponse({"transcript": row[0]})
+        return JSONResponse({"transcript": row["transcript"]})
         
     except HTTPException:
         raise
@@ -1103,3 +1107,231 @@ async def get_contacts_simple_list(user=Depends(get_current_user)):
         )
 
 
+
+@router.post("/livekit-webhook")
+async def livekit_webhook(request: Request):
+    try:
+        data = await request.json()
+        event = data.get("event")
+        room = data.get("room", {})
+        call_id = room.get("name")
+
+        # Extract call_id from egress events
+        if not call_id:
+            egress_info = data.get("egress_info", {}) or data.get("egressInfo", {})
+            call_id = egress_info.get("room_name") or egress_info.get("roomName")
+            if not call_id:
+                return JSONResponse({"message": "No call_id"})
+
+        # Always log event
+        add_call_event(call_id, event, data)
+        
+        # Ignore non-critical events
+        if event in ["room_started", "participant_joined", "egress_started", 
+                     "egress_updated", "track_published", "track_unpublished"]:
+            return JSONResponse({"message": f"{event} logged"})
+
+        # Handle room end
+        if event in ["room_finished", "participant_left"]:
+            await asyncio.sleep(0.5)
+            
+            # ✅ FIXED: Use context manager
+            with db.conn() as (conn, cursor):
+                cursor.execute("""
+                    SELECT status, events_log, started_at, created_at
+                    FROM call_history WHERE call_id = %s
+                """, (call_id,))
+                row = cursor.fetchone()
+
+            if not row:
+                return JSONResponse({"message": "Call not found"})
+
+            # ✅ Handle both dict and tuple results
+            if isinstance(row, dict):
+                current_status = row["status"]
+                events_log = row["events_log"]
+                db_started_at = row["started_at"]
+                created_at = row["created_at"]
+            else:
+                current_status, events_log, db_started_at, created_at = row
+            
+            # Skip if already final
+            if current_status in {"completed", "unanswered"}:
+                started = db_started_at or created_at
+                ended = datetime.now(timezone.utc)
+                duration = (ended - started).total_seconds() if started else 0
+                
+                db.update_call_history(call_id, {
+                    "duration": max(0, duration),
+                    "ended_at": ended
+                })
+                return JSONResponse({"message": "Duration updated"})
+
+            # Determine final status
+            previously_connected = current_status in {"connected", "completed"}
+
+            answered = check_if_answered(events_log)
+            if answered or previously_connected:
+                final_status = "completed"
+            else:
+                final_status = "unanswered"
+            
+            started = db_started_at or created_at
+            ended = datetime.now(timezone.utc)
+            duration = (ended - started).total_seconds() if (answered and started) else 0
+
+            db.update_call_history(call_id, {
+                "status": final_status,
+                "duration": max(0, duration),
+                "ended_at": ended,
+                "started_at": started
+            })
+            
+            return JSONResponse({"message": f"Call ended: {final_status}"})
+
+        # Handle recording
+        elif event == "egress_ended":
+            egress_info = data.get("egress_info", {}) or data.get("egressInfo", {})
+            file_results = egress_info.get("file_results", []) or egress_info.get("fileResults", [])
+            
+            if file_results:
+                file_info = file_results[0] if isinstance(file_results, list) else file_results
+                location = file_info.get("location") or file_info.get("download_url")
+                
+                if location:
+                    db.update_call_history(call_id, {"recording_url": location})
+                    return JSONResponse({"message": "Recording saved"})
+
+        return JSONResponse({"message": f"{event} processed"})
+
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.get("/call-status/{call_id}")
+async def get_call_status(call_id: str):
+    """Optimized status check with proper connection handling"""
+    try:
+        # ✅ FIXED: Use context manager
+        with db.conn() as (conn, cursor):
+            cursor.execute("""
+                SELECT status, created_at, ended_at, duration, started_at
+                FROM call_history 
+                WHERE call_id = %s
+            """, (call_id,))
+            row = cursor.fetchone()
+        
+        if not row:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "not_found", "is_final": True}
+            )
+        
+        # ✅ Handle both dict and tuple
+        if isinstance(row, dict):
+            current_status = row["status"]
+            created_at = row["created_at"]
+            ended_at = row["ended_at"]
+            duration = row["duration"]
+            started_at = row["started_at"]
+        else:
+            current_status, created_at, ended_at, duration, started_at = row
+        
+        # Normalize status
+        if current_status not in {"initialized", "dialing", "connected", "completed", "unanswered"}:
+            STATUS_MAP = {
+                "initiated": "initialized",
+                "in_progress": "connected",
+                "failed": "unanswered",
+                "not_attended": "unanswered"
+            }
+            current_status = STATUS_MAP.get(current_status, "initialized")
+        
+        # Calculate elapsed time
+        time_elapsed = 0
+        if created_at:
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            time_elapsed = (datetime.now(timezone.utc) - created_at).total_seconds()
+        
+        is_final = current_status in {"completed", "unanswered"}
+        
+        response = {
+            "status": current_status,
+            "message": {
+                "initialized": "Initializing...",
+                "dialing": "Dialing...",
+                "connected": "Call in progress",
+                "completed": "Call completed",
+                "unanswered": "Call not answered"
+            }.get(current_status, current_status),
+            "time_elapsed": round(time_elapsed, 1),
+            "is_final": is_final
+        }
+        
+        if is_final and duration:
+            response["duration"] = round(duration, 1)
+        
+        if started_at:
+            response["started_at"] = started_at.isoformat()
+        if ended_at:
+            response["ended_at"] = ended_at.isoformat()
+        
+        return JSONResponse(response)
+        
+    except Exception as e:
+        logging.error(f"get_call_status error: {e}")
+        traceback.print_exc()
+        return JSONResponse(
+            {"status": "error", "message": str(e), "is_final": True},
+            status_code=500
+        )
+
+
+@router.post("/agent/report-event")
+async def receive_agent_event(request: Request):
+    try:
+        data = await request.json()
+        
+        call_id = data.get("call_id")
+        status = data.get("status")
+        timestamp = data.get("timestamp")
+        
+        if not call_id or not status:
+            return JSONResponse({"error": "Missing data"}, status_code=400)
+        
+        if status not in {"initialized", "dialing", "connected", "unanswered"}:
+            return JSONResponse({"error": "Invalid status"}, status_code=400)
+        
+        updates = {"status": status}
+        now = datetime.now(timezone.utc)
+        
+        # Set started_at on dialing or connected
+        if status in {"dialing", "connected"}:
+            # ✅ FIXED: Use context manager
+            with db.conn() as (conn, cursor):
+                cursor.execute(
+                    "SELECT started_at FROM call_history WHERE call_id = %s",
+                    (call_id,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    started = row.get("started_at") if isinstance(row, dict) else row[0]
+                    if not started:
+                        updates["started_at"] = now
+        
+        # Handle unanswered
+        if status == "unanswered":
+            updates["ended_at"] = now
+            updates["duration"] = 0
+        
+        db.update_call_history(call_id, updates)
+        
+        return JSONResponse({"success": True})
+        
+    except Exception as e:
+        logging.error(f"report-event error: {e}")
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)

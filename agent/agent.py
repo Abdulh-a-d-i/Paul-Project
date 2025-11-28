@@ -11,10 +11,11 @@ from datetime import datetime, timedelta,timezone
 import traceback
 import httpx
 from dotenv import load_dotenv
+import boto3
+from botocore.exceptions import ClientError
 
-# Google Cloud imports
-from google.cloud import storage
-from google.oauth2 import service_account
+
+
 
 # LiveKit imports
 from livekit import rtc, api
@@ -44,15 +45,17 @@ logger.setLevel(logging.INFO)
 
 # Environment variables
 OUTBOUND_TRUNK_ID = os.getenv("SIP_OUTBOUND_TRUNK_ID")
-BACKEND_API_URL = os.getenv("BACKEND_API_URL", "https://full-shrimp-deeply.ngrok-free.app")
-GOOGLE_BUCKET_NAME = os.getenv("GOOGLE_BUCKET_NAME") or os.getenv("GCS_BUCKET_NAME")
-GCP_KEY_B64 = os.getenv("GCP_SERVICE_ACCOUNT_KEY_BASE64")
+BACKEND_API_URL = os.getenv("BACKEND_API_URL", "http://3.135.250.76:8000")
+AWS_BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 UPLOAD_TRANSCRIPTS = os.getenv("UPLOAD_TRANSCRIPTS", "true").lower() in ("1", "true", "yes")
 UPLOAD_RECORDINGS = os.getenv("UPLOAD_RECORDINGS", "true").lower() in ("1", "true", "yes")
 
 # Turn detection parameters
-TURN_DETECTION_MIN_ENDPOINTING_DELAY = float(os.getenv("TURN_DETECTION_MIN_ENDPOINTING_DELAY", "0.5"))
-TURN_DETECTION_MIN_SILENCE_DURATION = float(os.getenv("TURN_DETECTION_MIN_SILENCE_DURATION", "0.5"))
+TURN_DETECTION_MIN_ENDPOINTING_DELAY = float(os.getenv("TURN_DETECTION_MIN_ENDPOINTING_DELAY", "0.3"))
+TURN_DETECTION_MIN_SILENCE_DURATION = float(os.getenv("TURN_DETECTION_MIN_SILENCE_DURATION", "0.3"))
 
 async def _speak_status_update(ctx: RunContext, message: str, delay: float = 0.3):
     """Speak a brief status update before performing an action."""
@@ -60,25 +63,39 @@ async def _speak_status_update(ctx: RunContext, message: str, delay: float = 0.3
     await ctx.session.say(message, allow_interruptions=True)
     await asyncio.sleep(0.2)  # Brief pause after speaking
 
-def get_gcs_client():
-    """Initialize GCS client using base64-encoded service account JSON."""
-    if not GCP_KEY_B64:
-        raise RuntimeError("Missing GCP_SERVICE_ACCOUNT_KEY_BASE64 env var")
+def get_s3_client():
+    """Initialize AWS S3 client"""
+    if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
+        raise RuntimeError("Missing AWS credentials (AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY)")
+    
+    if not AWS_BUCKET_NAME:
+        raise RuntimeError("Missing AWS_S3_BUCKET_NAME environment variable")
     
     try:
-        decoded = base64.b64decode(GCP_KEY_B64).decode("utf-8")
-        key_json = json.loads(decoded)
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_REGION
+        )
+        
+        # Test connection
+        s3_client.head_bucket(Bucket=AWS_BUCKET_NAME)
+        logger.info(f"✅ S3 client initialized: {AWS_BUCKET_NAME}")
+        
+        return s3_client
+        
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        if error_code == '404':
+            raise RuntimeError(f"S3 bucket '{AWS_BUCKET_NAME}' not found")
+        elif error_code == '403':
+            raise RuntimeError(f"Access denied to bucket '{AWS_BUCKET_NAME}'")
+        else:
+            raise RuntimeError(f"S3 client error: {e}")
     except Exception as e:
-        raise RuntimeError(f"Invalid base64 GCP key: {e}")
+        raise RuntimeError(f"Failed to initialize S3 client: {e}")
     
-    # Validate required fields
-    for req in ("project_id", "client_email", "private_key"):
-        if req not in key_json:
-            raise RuntimeError(f"GCP key missing required field: {req}")
-    
-    credentials = service_account.Credentials.from_service_account_info(key_json)
-    client = storage.Client(credentials=credentials, project=key_json.get("project_id"))
-    return client
 
 async def send_status_to_backend(
     call_id: str,
@@ -846,7 +863,6 @@ async def entrypoint(ctx: JobContext):
     call_context = dial_info.get("call_context", "booking an appointment")
     user_id = dial_info.get("user_id")
     
-    #  Extract voice and language from metadata
     voice_id = dial_info.get("voice_id", os.getenv("ELEVENLABS_VOICE_ID"))
     voice_name = dial_info.get("voice_name", "default")
     language = dial_info.get("language", "en")
@@ -865,13 +881,10 @@ async def entrypoint(ctx: JobContext):
         logger.error(" Missing phone_number in metadata")
         return
 
-    #  Pass entire dial_info to agent (includes system_prompt)
     agent = SimpleOutboundCaller(call_context=call_context, dial_info=dial_info)
     
-    #  Use MultilingualModel for all languages (supports English too)
     turn_detector = MultilingualModel()
     
-    # Create session with DYNAMIC voice, language, and turn detection
     session = AgentSession(
         llm=openai.LLM(
             model="gpt-4.1-mini",
@@ -893,52 +906,48 @@ async def entrypoint(ctx: JobContext):
 
 
     async def upload_transcript():
-        """Upload transcript to GCS and send metadata to backend"""
+        """Upload transcript to S3"""
         if not UPLOAD_TRANSCRIPTS:
             logger.info("⏭️ Transcript upload disabled")
             return
 
         try:
-            # Generate transcript JSON
             transcript_obj = session.history.to_dict() if hasattr(session, 'history') else {"messages": []}
             transcript_json = json.dumps(transcript_obj, indent=2)
             
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             safe_phone = phone_number.replace("+", "").replace("-", "").replace(" ", "")
-            blob_name = f"transcripts/{ctx.room.name}_{safe_phone}_{ts}.json"
+            s3_key = f"transcripts/{ctx.room.name}_{safe_phone}_{ts}.json"
 
-            # Upload to GCS
-            gcs = get_gcs_client()
-            bucket = gcs.bucket(GOOGLE_BUCKET_NAME)
-            blob = bucket.blob(blob_name)
-            blob.upload_from_string(transcript_json, content_type="application/json")
-            
-            # Generate signed URL (optional - backend can use blob path directly)
-            signed_url = blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(hours=24),
-                method="GET"
+            # Upload to S3
+            s3 = get_s3_client()
+            s3.put_object(
+                Bucket=AWS_BUCKET_NAME,
+                Key=s3_key,
+                Body=transcript_json.encode('utf-8'),
+                ContentType="application/json"
             )
             
-            logger.info(f" Transcript uploaded: {blob_name}")
+            logger.info(f"✅ Transcript uploaded: {s3_key}")
 
-            #  Build payload with BOTH URLs and blob paths
+            # Generate presigned URL (24h expiry)
+            signed_url = s3.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': AWS_BUCKET_NAME, 'Key': s3_key},
+                ExpiresIn=86400
+            )
+
             payload = {
                 "user_id": agent.user_id,
                 "call_id": ctx.room.name,
                 "transcript_url": signed_url,
-                "transcript_blob": blob_name,  # ← Backend uses this for direct GCS access
-                "recording_url": agent.recording_url,  # ← Optional (may be None)
-                "recording_blob": agent.recording_blob_path,  # ← CRITICAL: Backend needs this!
+                "transcript_blob": s3_key,
+                "recording_url": agent.recording_url,
+                "recording_blob": agent.recording_blob_path,
                 "uploaded_at": ts
             }
             
-            logger.info(f"📤 Sending call data to backend:")
-            logger.info(f"   Call ID: {ctx.room.name}")
-            logger.info(f"   Transcript blob: {blob_name}")
-            logger.info(f"   Recording blob: {agent.recording_blob_path}")
-            
-            # Send to backend with retries
+            # Send to backend
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -948,56 +957,48 @@ async def entrypoint(ctx: JobContext):
                             json=payload
                         )
                         if response.status_code == 200:
-                            logger.info(" Call data sent to backend")
+                            logger.info("✅ Data sent to backend")
                             break
-                        else:
-                            logger.warning(f" Backend returned {response.status_code}")
-                            logger.warning(f"   Response: {response.text[:200]}")
                 except httpx.ReadTimeout:
                     if attempt < max_retries - 1:
-                        logger.warning(f" Timeout on attempt {attempt + 1}, retrying...")
                         await asyncio.sleep(2)
-                    else:
-                        logger.error(f" Backend timeout after {max_retries} attempts")
                 except Exception as e:
-                    logger.error(f" Backend request failed: {e}")
+                    logger.error(f"Backend error: {e}")
                     break
 
         except Exception as e:
-            logger.error(f" Transcript upload failed: {e}")
-            import traceback
+            logger.error(f"❌ Upload failed: {e}")
             traceback.print_exc()
     
     ctx.add_shutdown_callback(upload_transcript)
     
-    # ========== STATUS 1: INITIALIZED ==========
     await ctx.connect()
     await send_status_to_backend(ctx.room.name, "initialized", user_id)
 
-    # ============== START RECORDING ==============
+    # Start recording with AWS S3
     if UPLOAD_RECORDINGS:
         try:
             safe_phone = phone_number.replace("+", "").replace("-", "").replace(" ", "")
             ts = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-            recording_filename = f"recordings/{ctx.room.name}_{safe_phone}_{ts}.ogg"
+            recording_key = f"recordings/{ctx.room.name}_{safe_phone}_{ts}.ogg"
             
-            #  STORE BLOB PATH IN AGENT (Critical for backend access)
-            agent.recording_blob_path = recording_filename
+            agent.recording_blob_path = recording_key
             
-            logger.info(f"🎙️ Starting recording: {recording_filename}")
+            logger.info(f"🎙️ Starting recording: {recording_key}")
 
-            decoded_creds = base64.b64decode(GCP_KEY_B64).decode("utf-8")
-            
+            # Build S3 upload config for LiveKit
             req = api.RoomCompositeEgressRequest(
                 room_name=ctx.room.name,
                 audio_only=True,
                 file_outputs=[
                     api.EncodedFileOutput(
                         file_type=api.EncodedFileType.OGG,
-                        filepath=recording_filename,
-                        gcp=api.GCPUpload(
-                            bucket=GOOGLE_BUCKET_NAME,
-                            credentials=decoded_creds
+                        filepath=recording_key,
+                        s3=api.S3Upload(
+                            access_key=AWS_ACCESS_KEY_ID,
+                            secret=AWS_SECRET_ACCESS_KEY,
+                            region=AWS_REGION,
+                            bucket=AWS_BUCKET_NAME
                         )
                     )
                 ],
@@ -1012,56 +1013,44 @@ async def entrypoint(ctx: JobContext):
             egress_resp = await lkapi.egress.start_room_composite_egress(req)
             agent.egress_id = egress_resp.egress_id
             
-            #  Build recording URL (optional - backend can access directly via blob path)
-            agent.recording_url = f"https://storage.googleapis.com/{GOOGLE_BUCKET_NAME}/{recording_filename}"
+            agent.recording_url = f"https://{AWS_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{recording_key}"
             
-            logger.info(f" Recording started (egress_id: {agent.egress_id})")
-            logger.info(f"   Recording blob path: {agent.recording_blob_path}")
+            logger.info(f"✅ Recording started (ID: {agent.egress_id})")
             
-            #  IMMEDIATELY notify backend of recording blob path
-            # This allows backend to start preparing to download once recording finishes
+            # Notify backend
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
                     await client.post(
                         f"{BACKEND_API_URL}/api/update-call-recording",
                         json={
                             "call_id": ctx.room.name,
-                            "recording_blob": recording_filename,
+                            "recording_blob": recording_key,
                             "recording_url": agent.recording_url
                         }
                     )
-                    logger.info(f" Recording blob path sent to backend")
             except Exception as e:
-                logger.warning(f" Could not send recording path to backend: {e}")
-                # Not critical - will be sent again in upload_transcript()
+                logger.warning(f"Could not notify backend: {e}")
             
             await lkapi.aclose()
             
         except Exception as e:
-            logger.error(f" Failed to start recording: {e}")
-            import traceback
+            logger.error(f"❌ Recording failed: {e}")
             traceback.print_exc()
     else:
         logger.info("⏭️ Recording disabled")
 
-    # Load appointments (non-blocking)
     asyncio.create_task(agent.load_appointments())
 
-    # Background audio
     background_audio = BackgroundAudioPlayer(
         thinking_sound=[
             AudioConfig(BuiltinAudioClip.OFFICE_AMBIENCE, volume=0.5),
-            AudioConfig(BuiltinAudioClip.KEYBOARD_TYPING2, volume=0.8),
         ],
     )
     await background_audio.start(room=ctx.room, agent_session=session)
 
     try:
-        # ========== STATUS 2: DIALING ==========
-        logger.info(f" Dialing {phone_number}...")
-        asyncio.create_task(
-            send_status_to_backend(ctx.room.name, "dialing", user_id)
-        )
+        logger.info(f"📞 Dialing {phone_number}...")
+        asyncio.create_task(send_status_to_backend(ctx.room.name, "dialing", user_id))
         
         sip_response = await ctx.api.sip.create_sip_participant(
             api.CreateSIPParticipantRequest(
@@ -1074,98 +1063,49 @@ async def entrypoint(ctx: JobContext):
         )
         
         agent.set_sip_call_id(sip_response.sip_call_id)
-        logger.info(f" SIP call created: {sip_response.sip_call_id}")
+        logger.info(f"✅ SIP call: {sip_response.sip_call_id}")
 
         participant = await ctx.wait_for_participant(identity=f"sip-{phone_number}")
         agent.set_participant(participant)
-        logger.info(f" Participant joined: {participant.identity}")
 
-        # ========== STATUS 3: CONNECTED ==========
-        #  Set started_at timestamp when call connects
+        # Set started_at
         try:
             started_at = datetime.now(timezone.utc).isoformat()
             async with httpx.AsyncClient(timeout=5.0) as client:
                 await client.post(
                     f"{BACKEND_API_URL}/api/update-call-started",
-                    json={
-                        "call_id": ctx.room.name,
-                        "started_at": started_at
-                    }
+                    json={"call_id": ctx.room.name, "started_at": started_at}
                 )
-                logger.info(f" Started_at timestamp set: {started_at}")
         except Exception as e:
-            logger.warning(f" Could not set started_at: {e}")
+            logger.warning(f"Could not set started_at: {e}")
         
-        asyncio.create_task(
-            send_status_to_backend(ctx.room.name, "connected", user_id)
-        )
+        asyncio.create_task(send_status_to_backend(ctx.room.name, "connected", user_id))
 
-        # NOW start session (AFTER status sent)
         session_task = asyncio.create_task(
             session.start(agent=agent, room=ctx.room, room_input_options=RoomInputOptions())
         )
 
         await asyncio.sleep(0.5)
+        
         if language == "es":
-            greeting = f"¡Hola! Soy {agent.agent_name} llamando de parte de {agent.caller_name}. ¿Cómo estás hoy?"
-        else: # Default to English
-            greeting = f"Hi! This is {agent.agent_name} calling on behalf of {agent.caller_name}. How are you doing today?"
+            greeting = f"¡Hola! Soy {agent.agent_name} llamando de parte de {agent.caller_name}."
+        else:
+            greeting = f"Hi! This is {agent.agent_name} calling on behalf of {agent.caller_name}."
 
-        # Speak the selected greeting
-        logger.info(f"🗣️ Speaking initial greeting in '{language}': {greeting}")
-        await session.say(
-            greeting,
-            allow_interruptions=True
-        )
-
+        await session.say(greeting, allow_interruptions=True)
         await session_task
-        logger.info(" Full session completed")
 
     except api.TwirpError as e:
-        # ========== STATUS 4: UNANSWERED ==========
-        logger.error(f" SIP dial failed: {e.message}")
-        
-        await send_status_to_backend(
-            ctx.room.name, 
-            "unanswered", 
-            user_id,
-            error_details={"reason": "sip_failed", "error_message": e.message}
-        )
-        
-        #  Update DB directly as backup
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                await client.post(
-                    f"{BACKEND_API_URL}/api/agent/save-call-data",
-                    json={
-                        "call_id": ctx.room.name,
-                        "user_id": user_id,
-                        "status": "unanswered",
-                        "transcript_url": None,
-                        "recording_url": None
-                    }
-                )
-        except:
-            pass
-                
+        logger.error(f"❌ SIP failed: {e.message}")
+        await send_status_to_backend(ctx.room.name, "unanswered", user_id)
         ctx.shutdown()
         
     except Exception as e:
-        logger.error(f" Unexpected error: {e}")
-        
-        await send_status_to_backend(
-            ctx.room.name,
-            "failed",
-            user_id,
-            error_details={
-                "reason": "error",
-                "error_message": str(e)
-            }
-        )
-        
-        import traceback
+        logger.error(f"❌ Error: {e}")
+        await send_status_to_backend(ctx.room.name, "failed", user_id)
         traceback.print_exc()
         ctx.shutdown()
+
 
 if __name__ == "__main__":
     cli.run_app(
