@@ -17,10 +17,11 @@ from fastapi import (
     Request,
 )
 from datetime import datetime
+from src.services.google_calendar_service import GoogleCalendarService
 
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse,StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi import HTTPException, Response, UploadFile, File
 from rich import print
@@ -41,15 +42,54 @@ from src.api.base_models import (
     UpdatePromptRequest,
     CreatePromptRequest,
     SingleCallPayload,
-    BulkCallPayload
+    BulkCallPayload,
+    AddVoiceRequest, 
+    VoiceResponse,
+    ForgotPasswordRequest,
+    ResetPasswordRequest 
+
 )
 from src.utils.db import PGDB 
 from src.utils.mail_management import Send_Mail
 from src.utils.jwt_utils import create_access_token
 from src.utils.utils import get_current_user,add_call_event, generate_presigned_url,fetch_and_store_transcript,fetch_and_store_recording, calculate_duration, check_if_answered
-from livekit import api
+#
+# LiveKit removed (Retell is calling provider)
+#
 from src.models.System_Prompt import PromptBuilder
 import csv
+
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
+from datetime import datetime
+from src.services.google_calendar_service import GoogleCalendarService
+from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
+import json
+from twilio.rest import Client
+from src.utils.retell_utils import (
+    verify_retell_signature,
+    extract_retell_event_and_call,
+    ms_epoch_to_datetime,
+    build_transcript_snapshot,
+    retell_get_agent,
+    retell_list_voices,
+    retell_update_agent,
+    retell_publish_agent,
+    retell_get_conversation_flow,
+    retell_update_conversation_flow,
+    retell_create_phone_call,
+)
+
+# Google OAuth Configuration
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/api/google/callback")
+GOOGLE_SCOPES = ['https://www.googleapis.com/auth/calendar']
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID")
 load_dotenv()
 
 router = APIRouter()
@@ -69,7 +109,284 @@ def error_response(message, status_code=400):
         content={"error": message}
     )
 
+def send_appointment_confirmation_sms(
+    phone_number: str,
+    appointment_date: str,
+    start_time: str,
+    title: str,
+    attendee_name: str
+):
+    """
+    Send SMS confirmation through Twilio Messaging Service (with A2P 10DLC campaign)
+    """
+    try:
+        if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_MESSAGING_SERVICE_SID]):
+            logging.warning("⚠️ Twilio credentials not configured, skipping SMS")
+            return False
+        
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        
+        # Format date and time
+        from datetime import datetime
+        date_obj = datetime.strptime(appointment_date, "%Y-%m-%d")
+        formatted_date = date_obj.strftime("%B %d, %Y")
+        
+        time_obj = datetime.strptime(start_time, "%H:%M")
+        formatted_time = time_obj.strftime("%I:%M %p")
+        
+        # Message body
+        message_body = f"""✅ Appointment Confirmed!
 
+Date: {formatted_date}
+Time: {formatted_time}
+Service: {title}
+Location: {attendee_name}
+
+Thank you for booking! We look forward to seeing you.
+
+Reply CANCEL to reschedule."""
+        
+        # ⭐ Send through Messaging Service (automatically uses campaign)
+        message = client.messages.create(
+            body=message_body,
+            messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
+            to=phone_number
+        )
+        
+        logging.info(f"✅ SMS sent via campaign to {phone_number} (SID: {message.sid})")
+        logging.info(f"   Campaign: Low Volume Mixed (CTYJ4B9)")
+        return True
+        
+    except Exception as e:
+        logging.error(f"❌ Failed to send SMS: {e}")
+        traceback.print_exc()
+        return False
+
+
+@router.post("/retell-webhook")
+async def retell_webhook(request: Request):
+    """
+    Retell account webhook: persist call status/transcript/recording into call_history.
+    Outbound project: no inbound routing webhook required.
+    """
+    raw_body = (await request.body()).decode("utf-8")
+    sig = request.headers.get("X-Retell-Signature")
+    if not verify_retell_signature(raw_body, sig):
+        raise HTTPException(status_code=401, detail="Invalid Retell signature")
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event, call = extract_retell_event_and_call(payload)
+    call_id = (call.get("call_id") or "").strip()
+    if not call_id:
+        return Response(status_code=204)
+
+    # Best-effort: try to resolve user_id from metadata/dynamic vars if present.
+    user_id = None
+    try:
+        meta = call.get("metadata") or {}
+        if isinstance(meta, dict) and meta.get("user_id") is not None:
+            user_id = int(meta.get("user_id"))
+    except Exception:
+        user_id = None
+    try:
+        dyn = call.get("collected_dynamic_variables") or {}
+        if user_id is None and isinstance(dyn, dict) and dyn.get("user_id") is not None:
+            user_id = int(dyn.get("user_id"))
+    except Exception:
+        pass
+
+    started_at = ms_epoch_to_datetime(call.get("start_timestamp"))
+    ended_at = ms_epoch_to_datetime(call.get("end_timestamp"))
+    duration = None
+    try:
+        if call.get("duration_ms") is not None:
+            duration = float(call.get("duration_ms")) / 1000.0
+    except Exception:
+        duration = None
+    recording_url = call.get("recording_url") or call.get("recording_multi_channel_url")
+    transcript = build_transcript_snapshot(call)
+
+    # Ensure row exists if we have a user_id, otherwise only append event log if row already exists.
+    exists = bool(db.execute("SELECT 1 FROM call_history WHERE call_id=%s LIMIT 1", (call_id,), fetchone=True))
+    if not exists and user_id is not None:
+        try:
+            db.insert_call_history(
+                user_id=user_id,
+                call_id=call_id,
+                status="connected",
+                to_number=call.get("to_number"),
+                from_number=call.get("from_number"),
+                voice_name="retell",
+                voice_id=None,
+                contact_first_name=None,
+                contact_email=None,
+                category=None,
+                call_outcome_status=None,
+            )
+        except Exception:
+            pass
+
+    updates: dict[str, Any] = {
+        "status": (event or call.get("call_status") or call.get("status") or "connected"),
+        "from_number": call.get("from_number"),
+        "to_number": call.get("to_number"),
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration": duration,
+        "recording_url": recording_url,
+    }
+    if transcript:
+        updates["transcript"] = transcript
+    try:
+        # Remove None values to avoid overwriting
+        safe = {k: v for k, v in updates.items() if v is not None}
+        if safe:
+            db.update_call_history(call_id, safe)
+    except Exception as e:
+        logging.warning("retell-webhook update_call_history failed: %s", e)
+    try:
+        add_call_event(call_id, f"retell_{event or 'event'}", payload)
+    except Exception:
+        pass
+    return Response(status_code=204)
+
+
+@router.get("/retell/flow/editor")
+async def retell_flow_editor(user=Depends(get_current_user)):
+    flow_id = (os.getenv("RETELL_CONVERSATION_FLOW_ID") or "").strip()
+    if not flow_id:
+        raise HTTPException(status_code=500, detail="RETELL_CONVERSATION_FLOW_ID is not configured")
+    flow = retell_get_conversation_flow(flow_id)
+    intro_id = flow.get("start_node_id")
+    intro_text = None
+    nodes = flow.get("nodes") or []
+    if intro_id and isinstance(nodes, list):
+        for n in nodes:
+            if isinstance(n, dict) and str(n.get("id")) == str(intro_id):
+                instr = n.get("instruction") or {}
+                if isinstance(instr, dict):
+                    intro_text = instr.get("text")
+                break
+    return JSONResponse(
+        content=jsonable_encoder(
+            {
+                "conversation_flow_id": flow.get("conversation_flow_id") or flow_id,
+                "version": flow.get("version"),
+                "global_prompt": flow.get("global_prompt"),
+                "intro_node_id": intro_id,
+                "intro_text": intro_text,
+            }
+        )
+    )
+
+
+@router.put("/retell/flow/prompt-and-intro")
+async def retell_flow_prompt_and_intro(body: dict, user=Depends(get_current_user)):
+    flow_id = (os.getenv("RETELL_CONVERSATION_FLOW_ID") or "").strip()
+    if not flow_id:
+        raise HTTPException(status_code=500, detail="RETELL_CONVERSATION_FLOW_ID is not configured")
+    global_prompt = body.get("global_prompt")
+    intro_node_id = (body.get("intro_node_id") or "").strip() or None
+    intro_text = body.get("intro_text")
+
+    updates: dict[str, Any] = {}
+    if global_prompt is not None:
+        updates["global_prompt"] = str(global_prompt)
+
+    if intro_text is not None:
+        current = retell_get_conversation_flow(flow_id)
+        nodes = current.get("nodes") or []
+        intro_id = intro_node_id or current.get("start_node_id")
+        if not intro_id:
+            raise HTTPException(status_code=400, detail="No intro node id available")
+        new_nodes: list[dict] = []
+        found = False
+        for n in nodes:
+            if not isinstance(n, dict):
+                continue
+            if str(n.get("id")) == str(intro_id):
+                nn = dict(n)
+                instr = nn.get("instruction") if isinstance(nn.get("instruction"), dict) else {}
+                instr2 = dict(instr)
+                instr2["type"] = instr2.get("type") or "prompt"
+                instr2["text"] = str(intro_text)
+                nn["instruction"] = instr2
+                new_nodes.append(nn)
+                found = True
+            else:
+                new_nodes.append(n)
+        if not found:
+            raise HTTPException(status_code=404, detail=f"Intro node '{intro_id}' not found")
+        updates["nodes"] = new_nodes
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No updates provided")
+    retell_update_conversation_flow(flow_id, updates)
+    return JSONResponse(content={"ok": True})
+
+
+@router.get("/retell/voices")
+async def retell_voices(user=Depends(get_current_user)):
+    agent_id = (os.getenv("RETELL_AGENT_ID") or "").strip()
+    if not agent_id:
+        raise HTTPException(status_code=500, detail="RETELL_AGENT_ID is not configured")
+    agent = retell_get_agent(agent_id)
+    voices = retell_list_voices()
+
+    def _norm(x: Any) -> str:
+        return str(x or "").strip().lower()
+
+    def _is_11labs(v: dict) -> bool:
+        vid = _norm(v.get("voice_id"))
+        prov = _norm(v.get("provider"))
+        return vid.startswith("11labs-") or prov in ("11labs", "elevenlabs")
+
+    allowed_lang = {"en", "eng", "english", "es", "spa", "spanish"}
+    out: list[dict] = []
+    for v in voices:
+        if not isinstance(v, dict):
+            continue
+        if not _is_11labs(v):
+            continue
+        if _norm(v.get("gender")) != "female":
+            continue
+        age = _norm(v.get("age")).replace("_", " ").replace("-", " ")
+        if "middle" not in age:
+            continue
+        lang = _norm(v.get("language") or v.get("lang"))
+        if lang and lang not in allowed_lang:
+            continue
+        out.append(
+            {
+                "voice_id": v.get("voice_id"),
+                "voice_name": v.get("voice_name"),
+                "provider": v.get("provider"),
+                "gender": v.get("gender"),
+                "age": v.get("age"),
+                "accent": v.get("accent"),
+                "language": v.get("language") or v.get("lang"),
+                "preview_audio_url": v.get("preview_audio_url"),
+            }
+        )
+
+    return JSONResponse(content=jsonable_encoder({"current_voice_id": agent.get("voice_id"), "voices": out}))
+
+
+@router.put("/retell/agent/voice")
+async def retell_set_voice(body: dict, user=Depends(get_current_user)):
+    agent_id = (os.getenv("RETELL_AGENT_ID") or "").strip()
+    if not agent_id:
+        raise HTTPException(status_code=500, detail="RETELL_AGENT_ID is not configured")
+    voice_id = (body.get("voice_id") or "").strip()
+    if not voice_id:
+        raise HTTPException(status_code=400, detail="voice_id must be non-empty")
+    retell_update_agent(agent_id, {"voice_id": voice_id})
+    retell_publish_agent(agent_id)
+    return JSONResponse(content={"ok": True, "voice_id": voice_id})
+    
 @router.post("/register")
 def register_user(user: UserRegister):
     user_dict = user.dict()
@@ -118,7 +435,7 @@ def login_user(user: UserLogin):
 
 
 voices = {
-    "sam elliott":"1Le150XwaOV6DjrgvGiL",
+    "sam elliott":"1Le15oXwaOV6DjrgvGiL",
     "peck":"KP0g0tgE6czKXsf2vmF6",
     "king":"1WVD88RnPY0xX4bYTFi4",
     "barry white":"sydt9eVyT7wySiR0Mcpo",
@@ -127,142 +444,116 @@ voices = {
     "wyatt":"YXpFCvM1S3JbWEJhoskW",
     "southern mike":"DwEFbvGTcJhAk9eY9m0f",
     "serafina":"4tRn1lSkEn13EVTuqb0g",
-    "paul":"6677dBjGbnngilI0IDYQ"
+    "paul":"6677dBjGbnngIll0IDYQ"
 }
 
 @router.post("/assistant-bulk-call")
-async def make_bulk_calls_with_livekit(
+async def assistant_bulk_call_retell(
     payload: BulkCallPayload,
-    user=Depends(get_current_user)
+    user=Depends(get_current_user),
 ):
-    
-    try:
-        # Get voice_id from voice name
-        voice_name = payload.voice.lower()
-        voice_id = voices.get(voice_name)
-        
-        if not voice_id:
-            logging.warning(f"Unknown voice '{voice_name}', using default 'david'")
-            voice_id = voices["Paul"]
-            voice_name = "Paul"
-        
-        # Validate language
-        language = payload.language.lower()
-        if language not in ["en", "es"]:
-            logging.warning(f"Unknown language '{language}', defaulting to 'en'")
-            language = "en"
-        
-        logging.info(f" Bulk call: voice={voice_name}, language={language}")
-        logging.info(f" Calling {len(payload.phone_numbers)} numbers")
-        
-        build_system_prompt = PromptBuilder()
+    """
+    Outbound call initiation via Retell (v2/create-phone-call).
+    Creates one Retell call per phone number and stores the returned call_id in DB.
+    """
+    agent_id = (os.getenv("RETELL_AGENT_ID") or "").strip()
+    from_number = (
+        os.getenv("RETELL_FROM_NUMBER")
+        or os.getenv("RETELL_OUTBOUND_FROM_NUMBER")
+        or os.getenv("RETELL_OUTBOUND_NUMBER")
+        or ""
+    ).strip()
+    if not agent_id:
+        raise HTTPException(status_code=500, detail="RETELL_AGENT_ID is not configured")
+    if not from_number:
+        raise HTTPException(status_code=500, detail="RETELL_FROM_NUMBER is not configured")
 
-        system_prompt = build_system_prompt.generate_complete_prompt(payload.system_prompt)
-        
-        logging.info(f"📝 Using provided system prompt ({len(system_prompt)} chars)")
-        
-        initiated_calls = []
-        failed_calls = []
-        
-        for phone_number in payload.phone_numbers:
+    initiated_calls: list[dict] = []
+    failed_calls: list[dict] = []
+
+    # Fetch agent once for current voice_id (optional for DB/UI)
+    agent = None
+    try:
+        agent = retell_get_agent(agent_id)
+    except Exception:
+        agent = None
+    current_voice_id = (agent or {}).get("voice_id") if isinstance(agent, dict) else None
+
+    for idx, to_number in enumerate(payload.phone_numbers or []):
+        try:
+            phone = (to_number or "").strip()
+            if not phone:
+                raise ValueError("empty phone number")
+
+            contact_first_name = None
+            if getattr(payload, "first_names", None) and len(payload.first_names) == len(payload.phone_numbers):
+                contact_first_name = payload.first_names[idx]
+            else:
+                contact_first_name = getattr(payload, "first_name", None)
+
+            meta = {
+                "user_id": str(user["id"]),
+                "category": str(getattr(payload, "category", "") or ""),
+                "contact_first_name": str(contact_first_name or ""),
+                "contact_email": str(getattr(payload, "email", "") or ""),
+            }
+            dyn = {
+                "user_id": str(user["id"]),
+                "contact_first_name": str(contact_first_name or ""),
+                "contact_email": str(getattr(payload, "email", "") or ""),
+                "category": str(getattr(payload, "category", "") or ""),
+            }
+
+            resp = retell_create_phone_call(
+                from_number=from_number,
+                to_number=phone,
+                override_agent_id=agent_id,
+                metadata=meta,
+                dynamic_variables=dyn,
+            )
+            call_id = (resp.get("call_id") or "").strip()
+            if not call_id:
+                raise RuntimeError("Retell did not return call_id")
+
+            # Store initial DB row (status updated later via /retell-webhook)
+            db.insert_call_history(
+                user_id=user["id"],
+                call_id=call_id,
+                status="initiated",
+                voice_id=current_voice_id,
+                voice_name=None,
+                to_number=phone,
+                contact_first_name=contact_first_name,
+                contact_email=getattr(payload, "email", None),
+                category=getattr(payload, "category", None),
+                call_outcome_status=None,
+            )
             try:
-                # Generate unique room name for this call
-                timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-                room_name = f"call-{user['id']}-{phone_number.replace('+', '').replace('-', '')}-{timestamp}"
-                
-                # Prepare metadata for this specific call
-                metadata = {
-                    "phone_number": phone_number,
-                    # "call_context": payload.context,
-                    "user_id": user["id"],
-                    "caller_name": payload.caller_name,
-                    "caller_email": user["email"],
-                    "system_prompt": system_prompt,  # Use provided prompt
-                    "agent_name": "PAUL",
-                    "voice_id": voice_id,
-                    "voice_name": voice_name,
-                    "language": language
+                add_call_event(call_id, "retell_call_initiated", {"to_number": phone})
+            except Exception:
+                pass
+
+            initiated_calls.append(
+                {
+                    "call_id": call_id,
+                    "to_number": phone,
                 }
-                
-                logging.info(f"📞 Initiating call to {phone_number} (room: {room_name})")
-                
-                # Create DB record
-                db.insert_call_history(
-                    user_id=user["id"],
-                    call_id=room_name,
-                    status="initiated",
-                    to_number=phone_number,
-                    voice_name=voice_name,
-                )
-                
-                add_call_event(room_name, "call_initiated", {
-                    "user_id": user["id"],
-                    "phone_number": phone_number
-                })
-                
-                # Dispatch agent to LiveKit
-                async with api.LiveKitAPI(
-                    url=os.getenv("LIVEKIT_URL", "").replace("wss://", "https://"),
-                    api_key=os.getenv("LIVEKIT_API_KEY"),
-                    api_secret=os.getenv("LIVEKIT_API_SECRET"),
-                ) as lkapi:
-                    dispatch = await lkapi.agent_dispatch.create_dispatch(
-                        api.CreateAgentDispatchRequest(
-                            agent_name="outbound-caller",
-                            room=room_name,
-                            metadata=json.dumps(metadata),
-                        )
-                    )
-                
-                logging.info(f"✅ Call to {phone_number} dispatched: {dispatch.id}")
-                
-                initiated_calls.append({
-                    "call_id": room_name,
-                    "phone_number": phone_number,
-                    "dispatch_id": dispatch.id,
-                    "voice": voice_name,
-                    "language": language
-                })
-                
-                # Small delay to avoid overwhelming LiveKit
-                await asyncio.sleep(0.5)
-                
-            except Exception as e:
-                logging.error(f"❌ Failed to initiate call to {phone_number}: {e}")
-                traceback.print_exc()
-                
-                failed_calls.append({
-                    "phone_number": phone_number,
-                    "error": str(e)
-                })
-                
-                # Mark as failed in DB if room was created
-                if 'room_name' in locals():
-                    try:
-                        db.update_call_history(
-                            call_id=room_name,
-                            updates={"status": "failed"}
-                        )
-                    except:
-                        pass
-        
-        # Build response
-        response = {
-            "success": True,
-            "message": f"Initiated {len(initiated_calls)} of {len(payload.phone_numbers)} calls",
-            "total_calls": len(payload.phone_numbers),
-            "initiated_calls": initiated_calls,
-            "failed_calls": failed_calls
-        }
-        
-        logging.info(f"✅ Bulk call completed: {len(initiated_calls)} success, {len(failed_calls)} failed")
-        
-        return JSONResponse(response)
-        
-    except Exception as e:
-        logging.error(f"❌ Bulk call error: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Bulk call failed: {str(e)}")
+            )
+        except Exception as e:
+            failed_calls.append({"to_number": to_number, "error": str(e)})
+
+    return JSONResponse(
+        content=jsonable_encoder(
+            {
+                "success": True,
+                "total": len(payload.phone_numbers or []),
+                "initiated": len(initiated_calls),
+                "failed": len(failed_calls),
+                "calls": initiated_calls,
+                "errors": failed_calls,
+            }
+        )
+    )
 
 
 
@@ -475,6 +766,11 @@ async def get_user_call_history(
         calls = []
         for call in history.get("calls", []):
             call_data = {**call}
+
+            # Explicitly surface phone number and outcome status for each entry
+            call_data["phone_number"] = call.get("to_number")
+            call_data["call_outcome_status"] = call.get("call_outcome_status")
+            call_data["contact_call_status"] = call.get("contact_call_status")
             
             
             if call.get("created_at"):
@@ -521,9 +817,6 @@ async def get_user_call_history(
                 call_data["recording_presigned_url"] = presigned_url
             else:
                 call_data["recording_presigned_url"] = None
-            
-            calls.append(call_data)
-
             
             calls.append(call_data)
 
@@ -616,77 +909,137 @@ async def get_appointments(user_id: int, from_date: str = None):
 
 @router.post("/agent/book-appointment")
 async def book_appointment(request: Request):
-    """
-    API for LiveKit agent to book an appointment
-    """
     try:
         data = await request.json()
         
         user_id = data.get("user_id")
-        appointment_date = data.get("appointment_date") 
+        appointment_date = data.get("appointment_date")
         start_time = data.get("start_time")
         end_time = data.get("end_time")
-        attendee_name = data.get("attendee_name", "Valued Customer")
         title = data.get("title", "Appointment")
         description = data.get("description", "")
-        organizer_name = data.get("organizer_name")
+        attendee_name = data.get("attendee_name", "")
         organizer_email = data.get("organizer_email")
+        organizer_name = data.get("organizer_name", "")
+        notes = data.get("notes", "")
+        phone_number = data.get("phone_number")
         
-        if not all([user_id, appointment_date, start_time, end_time, organizer_email]):
-            return error_response("Missing required fields", status_code=400)
+        logging.info(f"Booking appointment for user {user_id}: {appointment_date} {start_time}-{end_time}")
         
-        has_conflict = db.check_appointment_conflict(
-            user_id=user_id,
-            appointment_date=appointment_date,
-            start_time=start_time,
-            end_time=end_time
-        )
-        
-        if has_conflict:
+        if not all([user_id, appointment_date, start_time, end_time]):
             return JSONResponse(
-                status_code=409,
-                content={
-                    "success": False,
-                    "message": "Time slot already booked",
-                    "conflict": True
-                }
+                status_code=400,
+                content={"success": False, "message": "Missing required fields"}
             )
         
-        appointment_id = db.create_appointment(
-            user_id=user_id,
-            appointment_date=appointment_date,
-            start_time=start_time,
-            end_time=end_time,
-            attendee_name=attendee_name,
-            attendee_email=organizer_email,
-            title=title,
-            description=description
-        )
+        google_event_id = None
+        google_success = False
         
-        email_sent = await mail_obj.send_email_with_calendar_event(
-            attendee_email=organizer_email,
-            attendee_name=organizer_name,
-            appointment_date=appointment_date,
-            start_time=start_time,
-            end_time=end_time,
-            title=title,
-            description=description,
-            organizer_name=organizer_name,
-            organizer_email=organizer_email
-        )
+        try:
+            credentials = db.get_google_credentials(user_id)
+            
+            if credentials:
+                logging.info("User has Google Calendar connected")
+                
+                from src.services.google_calendar_service import GoogleCalendarService
+                gcal = GoogleCalendarService(credentials)
+                
+                date_obj = datetime.fromisoformat(appointment_date)
+                start_hour, start_min = map(int, start_time.split(':'))
+                end_hour, end_min = map(int, end_time.split(':'))
+                
+                start_datetime = date_obj.replace(hour=start_hour, minute=start_min, tzinfo=timezone.utc)
+                end_datetime = date_obj.replace(hour=end_hour, minute=end_min, tzinfo=timezone.utc)
+                
+                attendees = [organizer_email] if organizer_email else []
+                
+                full_description = description
+                if notes:
+                    full_description += f"\n\nNotes: {notes}"
+                
+                event = gcal.create_event(
+                    summary=title,
+                    start_datetime=start_datetime,
+                    end_datetime=end_datetime,
+                    description=full_description,
+                    location=attendee_name,
+                    attendees=attendees
+                )
+                
+                google_event_id = event["id"]
+                google_success = True
+                
+                logging.info(f"Google Calendar event created: {google_event_id}")
+                
+                updated_creds = gcal.get_updated_credentials()
+                if updated_creds['access_token'] != credentials['access_token']:
+                    db.save_google_credentials(user_id, **updated_creds)
+            else:
+                logging.warning("User does not have Google Calendar connected")
         
-        return JSONResponse({
-            "success": True,
-            "appointment_id": appointment_id,
-            "email_sent": email_sent,
-            "message": "Appointment booked successfully"
-        })
+        except Exception as google_error:
+            logging.error(f"Google Calendar error: {google_error}")
+            traceback.print_exc()
+        
+        try:
+            appointment_id = db.create_appointment(
+                user_id=user_id,
+                appointment_date=appointment_date,
+                start_time=start_time,
+                end_time=end_time,
+                attendee_name=attendee_name,
+                attendee_email=organizer_email or "",
+                title=title,
+                description=description + (f"\n\nNotes: {notes}" if notes else "")
+            )
+            
+            logging.info(f"Appointment saved to database: ID {appointment_id}")
+            
+            if phone_number:
+                try:
+                    sms_sent = send_appointment_confirmation_sms(
+                        phone_number=phone_number,
+                        appointment_date=appointment_date,
+                        start_time=start_time,
+                        title=title,
+                        attendee_name=attendee_name
+                    )
+                    if sms_sent:
+                        logging.info(f"SMS confirmation sent to {phone_number}")
+                except Exception as sms_error:
+                    logging.error(f"SMS failed: {sms_error}")
+            
+            response = {
+                "success": True,
+                "message": "Appointment booked successfully",
+                "appointment_id": appointment_id,
+            }
+            
+            if google_success:
+                response["google_event_id"] = google_event_id
+                response["google_calendar"] = True
+            else:
+                response["google_calendar"] = False
+                response["note"] = "Saved locally"
+            
+            return JSONResponse(content=response)
+            
+        except Exception as db_error:
+            logging.error(f"Database error: {db_error}")
+            traceback.print_exc()
+            
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "message": f"Failed to save appointment: {str(db_error)}"}
+            )
         
     except Exception as e:
-        logging.error(f"Error booking appointment: {e}")
-        return error_response(f"Failed to book appointment: {str(e)}", status_code=500)
-
-
+        logging.error(f"Error in book_appointment: {e}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": f"Failed to book appointment: {str(e)}"}
+        )
 
 @router.post("/agent/save-call-data")
 async def save_call_data(request: Request):
@@ -708,7 +1061,7 @@ async def save_call_data(request: Request):
         if transcript_blob:
             async def delayed_transcript():
                 await asyncio.sleep(5)
-                logging.info(f"📄 Downloading transcript from S3")
+                logging.info(f" Downloading transcript from S3")
                 await fetch_and_store_transcript(call_id, None, transcript_blob)
             asyncio.create_task(delayed_transcript())
         
@@ -716,7 +1069,7 @@ async def save_call_data(request: Request):
         return JSONResponse({"success": True})
         
     except Exception as e:
-        logging.error(f"❌ save_call_data error: {e}")
+        logging.error(f" save_call_data error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
     
 
@@ -990,7 +1343,7 @@ async def get_call_recording_url(
 async def get_call_transcript(call_id: str, user=Depends(get_current_user)):
     """Get transcript for a specific call"""
     try:
-        # ✅ Use the context manager pattern
+        #  Use the context manager pattern
         with db.conn() as (conn, cursor):
             cursor.execute("""
                 SELECT transcript
@@ -1108,186 +1461,9 @@ async def get_contacts_simple_list(user=Depends(get_current_user)):
 
 
 
-@router.post("/livekit-webhook")
-async def livekit_webhook(request: Request):
-    try:
-        data = await request.json()
-        event = data.get("event")
-        room = data.get("room", {})
-        call_id = room.get("name")
-
-        # Extract call_id from egress events
-        if not call_id:
-            egress_info = data.get("egress_info", {}) or data.get("egressInfo", {})
-            call_id = egress_info.get("room_name") or egress_info.get("roomName")
-            if not call_id:
-                return JSONResponse({"message": "No call_id"})
-
-        # Always log event
-        add_call_event(call_id, event, data)
-        
-        # Ignore non-critical events
-        if event in ["room_started", "participant_joined", "egress_started", 
-                     "egress_updated", "track_published", "track_unpublished"]:
-            return JSONResponse({"message": f"{event} logged"})
-
-        # Handle room end
-        if event in ["room_finished", "participant_left"]:
-            await asyncio.sleep(0.5)
-            
-            # ✅ FIXED: Use context manager
-            with db.conn() as (conn, cursor):
-                cursor.execute("""
-                    SELECT status, events_log, started_at, created_at
-                    FROM call_history WHERE call_id = %s
-                """, (call_id,))
-                row = cursor.fetchone()
-
-            if not row:
-                return JSONResponse({"message": "Call not found"})
-
-            # ✅ Handle both dict and tuple results
-            if isinstance(row, dict):
-                current_status = row["status"]
-                events_log = row["events_log"]
-                db_started_at = row["started_at"]
-                created_at = row["created_at"]
-            else:
-                current_status, events_log, db_started_at, created_at = row
-            
-            # Skip if already final
-            if current_status in {"completed", "unanswered"}:
-                started = db_started_at or created_at
-                ended = datetime.now(timezone.utc)
-                duration = (ended - started).total_seconds() if started else 0
-                
-                db.update_call_history(call_id, {
-                    "duration": max(0, duration),
-                    "ended_at": ended
-                })
-                return JSONResponse({"message": "Duration updated"})
-
-            # Determine final status
-            previously_connected = current_status in {"connected", "completed"}
-
-            answered = check_if_answered(events_log)
-            if answered or previously_connected:
-                final_status = "completed"
-            else:
-                final_status = "unanswered"
-            
-            started = db_started_at or created_at
-            ended = datetime.now(timezone.utc)
-            duration = (ended - started).total_seconds() if (answered and started) else 0
-
-            db.update_call_history(call_id, {
-                "status": final_status,
-                "duration": max(0, duration),
-                "ended_at": ended,
-                "started_at": started
-            })
-            
-            return JSONResponse({"message": f"Call ended: {final_status}"})
-
-        # Handle recording
-        elif event == "egress_ended":
-            egress_info = data.get("egress_info", {}) or data.get("egressInfo", {})
-            file_results = egress_info.get("file_results", []) or egress_info.get("fileResults", [])
-            
-            if file_results:
-                file_info = file_results[0] if isinstance(file_results, list) else file_results
-                location = file_info.get("location") or file_info.get("download_url")
-                
-                if location:
-                    db.update_call_history(call_id, {"recording_url": location})
-                    return JSONResponse({"message": "Recording saved"})
-
-        return JSONResponse({"message": f"{event} processed"})
-
-    except Exception as e:
-        logging.error(f"Webhook error: {e}")
-        traceback.print_exc()
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-@router.get("/call-status/{call_id}")
-async def get_call_status(call_id: str):
-    """Optimized status check with proper connection handling"""
-    try:
-        # ✅ FIXED: Use context manager
-        with db.conn() as (conn, cursor):
-            cursor.execute("""
-                SELECT status, created_at, ended_at, duration, started_at
-                FROM call_history 
-                WHERE call_id = %s
-            """, (call_id,))
-            row = cursor.fetchone()
-        
-        if not row:
-            return JSONResponse(
-                status_code=404,
-                content={"status": "not_found", "is_final": True}
-            )
-        
-        # ✅ Handle both dict and tuple
-        if isinstance(row, dict):
-            current_status = row["status"]
-            created_at = row["created_at"]
-            ended_at = row["ended_at"]
-            duration = row["duration"]
-            started_at = row["started_at"]
-        else:
-            current_status, created_at, ended_at, duration, started_at = row
-        
-        # Normalize status
-        if current_status not in {"initialized", "dialing", "connected", "completed", "unanswered"}:
-            STATUS_MAP = {
-                "initiated": "initialized",
-                "in_progress": "connected",
-                "failed": "unanswered",
-                "not_attended": "unanswered"
-            }
-            current_status = STATUS_MAP.get(current_status, "initialized")
-        
-        # Calculate elapsed time
-        time_elapsed = 0
-        if created_at:
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=timezone.utc)
-            time_elapsed = (datetime.now(timezone.utc) - created_at).total_seconds()
-        
-        is_final = current_status in {"completed", "unanswered"}
-        
-        response = {
-            "status": current_status,
-            "message": {
-                "initialized": "Initializing...",
-                "dialing": "Dialing...",
-                "connected": "Call in progress",
-                "completed": "Call completed",
-                "unanswered": "Call not answered"
-            }.get(current_status, current_status),
-            "time_elapsed": round(time_elapsed, 1),
-            "is_final": is_final
-        }
-        
-        if is_final and duration:
-            response["duration"] = round(duration, 1)
-        
-        if started_at:
-            response["started_at"] = started_at.isoformat()
-        if ended_at:
-            response["ended_at"] = ended_at.isoformat()
-        
-        return JSONResponse(response)
-        
-    except Exception as e:
-        logging.error(f"get_call_status error: {e}")
-        traceback.print_exc()
-        return JSONResponse(
-            {"status": "error", "message": str(e), "is_final": True},
-            status_code=500
-        )
+#
+# LiveKit webhook/status endpoints removed (Retell is the calling provider).
+#
 
 
 @router.post("/agent/report-event")
@@ -1310,7 +1486,7 @@ async def receive_agent_event(request: Request):
         
         # Set started_at on dialing or connected
         if status in {"dialing", "connected"}:
-            # ✅ FIXED: Use context manager
+            #  FIXED: Use context manager
             with db.conn() as (conn, cursor):
                 cursor.execute(
                     "SELECT started_at FROM call_history WHERE call_id = %s",
@@ -1335,3 +1511,633 @@ async def receive_agent_event(request: Request):
         logging.error(f"report-event error: {e}")
         traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/agent/update-call-outcome")
+async def update_call_outcome(request: Request):
+    """Allow the agent to mark call outcome (booked, call_again, do_not_call) and sync contacts."""
+    try:
+        data = await request.json()
+        call_id = data.get("call_id")
+        outcome = (data.get("status") or "").strip().lower()
+
+        allowed = {"booked", "call_again", "do_not_call"}
+        if not call_id or outcome not in allowed:
+            return JSONResponse({"error": "Invalid call_id or status"}, status_code=400)
+
+        # Fetch user + phone for contact sync
+        with db.conn() as (conn, cursor):
+            cursor.execute(
+                """
+                SELECT user_id, to_number
+                FROM call_history
+                WHERE call_id = %s
+                """,
+                (call_id,)
+            )
+            row = cursor.fetchone()
+
+        if not row:
+            return JSONResponse({"error": "Call not found"}, status_code=404)
+
+        user_id = row.get("user_id") if isinstance(row, dict) else row[0]
+        to_number = row.get("to_number") if isinstance(row, dict) else row[1]
+
+        db.update_call_history(call_id, {"call_outcome_status": outcome})
+
+        if user_id and to_number:
+            try:
+                db.update_contact_status(user_id, to_number, outcome)
+            except Exception:
+                logging.warning("Unable to update contact status; continuing")
+
+        add_call_event(call_id, "call_outcome", {"status": outcome})
+
+        return JSONResponse({"success": True, "status": outcome})
+
+    except Exception as e:
+        logging.error(f"update_call_outcome error: {e}")
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.get("/analytics/call-outcomes")
+async def get_call_outcomes_summary(user=Depends(get_current_user)):
+    """Return counts of call outcome statuses for the signed-in user."""
+    try:
+        summary = db.get_call_outcome_summary(user["id"])
+        return JSONResponse({"success": True, "summary": summary})
+    except Exception as e:
+        logging.error(f"analytics call outcomes error: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to fetch call outcome analytics")
+    
+
+
+
+
+@router.post("/voices", response_model=VoiceResponse)
+async def add_new_voice(
+    request: Request,
+    user=Depends(get_current_user)
+):
+    """
+    Add a new voice to the global library.
+    
+    Body:
+    {
+        "voice_name": "Morgan Freeman",
+        "voice_id": "abc123xyz"
+    }
+    """
+    try:
+        data = await request.json()
+        
+        voice_name = data.get("voice_name", "").strip()
+        voice_id = data.get("voice_id", "").strip()
+        
+        if not voice_name:
+            return error_response("voice_name is required", status_code=400)
+        
+        if not voice_id:
+            return error_response("voice_id is required", status_code=400)
+        
+        if len(voice_name) > 255:
+            return error_response("voice_name too long (max 255 chars)", status_code=400)
+        
+        result = db.add_voice(voice_name, voice_id)
+        
+        return JSONResponse(content=jsonable_encoder({
+            "success": True,
+            "message": "Voice added successfully",
+            "voice": result
+        }), status_code=201)
+        
+    except ValueError as ve:
+        return error_response(str(ve), status_code=400)
+    except Exception as e:
+        logging.error(f"Error adding voice: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/voices")
+async def get_all_voices_list(user=Depends(get_current_user)):
+    """
+    Get all available voices from the global library.
+    
+    Returns:
+    {
+        "success": true,
+        "count": 15,
+        "voices": [
+            {
+                "voice_name": "Sam Elliott",
+                "voice_id": "1Le15oXwaOV6DjrgvGiL"
+            },
+            ...
+        ]
+    }
+    """
+    try:
+        voices = db.get_all_voices()
+        
+        return JSONResponse(content=jsonable_encoder({
+            "success": True,
+            "count": len(voices),
+            "voices": voices
+        }))
+        
+    except Exception as e:
+        logging.error(f"Error fetching voices: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/voices/{voice_id}")
+async def delete_voice_endpoint(
+    voice_id: str,
+    user=Depends(get_current_user)
+):
+    """
+    Delete a voice from the library by its voice_id.
+    """
+    try:
+        db.delete_voice(voice_id)
+        
+        return JSONResponse(content={
+            "success": True,
+            "message": "Voice deleted successfully"
+        })
+        
+    except Exception as e:
+        logging.error(f"Error deleting voice: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+
+
+
+
+
+@router.get("/google/auth/status")
+async def get_google_auth_status(user=Depends(get_current_user)):
+    """
+    Check if user has connected Google Calendar
+    """
+    try:
+        credentials = db.get_google_credentials(user["id"])
+        
+        if not credentials:
+            return JSONResponse({
+                "connected": False,
+                "message": "Google Calendar not connected"
+            })
+        
+        # Check if token is expired
+        token_expiry = credentials.get("token_expiry")
+        is_expired = False
+        
+        if token_expiry:
+            if isinstance(token_expiry, str):
+                token_expiry = datetime.fromisoformat(token_expiry.replace('Z', '+00:00'))
+            is_expired = token_expiry < datetime.now(timezone.utc)
+        
+        return JSONResponse({
+            "connected": True,
+            "expired": is_expired,
+            "message": "Google Calendar connected" if not is_expired else "Token expired, needs refresh"
+        })
+        
+    except Exception as e:
+        logging.error(f"Error checking Google auth status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/google/auth/login")
+async def google_calendar_login(user=Depends(get_current_user)):
+    """
+    Initiate Google OAuth flow
+    Returns authorization URL for frontend to redirect to
+    """
+    try:
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [GOOGLE_REDIRECT_URI]
+                }
+            },
+            scopes=GOOGLE_SCOPES
+        )
+        
+        flow.redirect_uri = GOOGLE_REDIRECT_URI
+        
+        # Generate authorization URL with user_id in state
+        authorization_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            state=str(user["id"]),  # Pass user_id in state
+            prompt='consent'  # Force consent to get refresh token
+        )
+        
+        return JSONResponse({
+            "authorization_url": authorization_url,
+            "state": state
+        })
+        
+    except Exception as e:
+        logging.error(f"Error initiating Google OAuth: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/google/callback")
+async def google_calendar_callback(
+    code: str = Query(...),
+    state: str = Query(...)
+):
+    """
+    Handle Google OAuth callback
+    Exchanges authorization code for access token
+    """
+    try:
+        # Extract user_id from state
+        user_id = int(state)
+        
+        flow = Flow.from_client_config(
+            {
+                "web": {
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": [GOOGLE_REDIRECT_URI]
+                }
+            },
+            scopes=GOOGLE_SCOPES
+        )
+        
+        flow.redirect_uri = GOOGLE_REDIRECT_URI
+        
+        # Exchange authorization code for tokens
+        flow.fetch_token(code=code)
+        
+        credentials = flow.credentials
+        
+        # Save to database
+        db.save_google_credentials(
+            user_id=user_id,
+            access_token=credentials.token,
+            refresh_token=credentials.refresh_token,
+            token_expiry=credentials.expiry,
+            scopes=credentials.scopes
+        )
+        
+        logging.info(f"✅ Google Calendar connected for user {user_id}")
+        
+        # --- THIS IS THE FIX ---
+        # We redirect the user to the frontend settings page
+        # You can hardcode your domain or use the env variable
+        frontend_url = os.getenv("FRONTEND_URL", "https://dialer.joinironfathers.com")
+        
+        return RedirectResponse(url=f"{frontend_url}/success")
+        
+    except Exception as e:
+        logging.error(f"Error in Google OAuth callback: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+        
+
+
+@router.post("/google/disconnect")
+async def disconnect_google_calendar(user=Depends(get_current_user)):
+    """
+    Disconnect Google Calendar (delete stored credentials)
+    """
+    try:
+        db.delete_google_credentials(user["id"])
+        
+        return JSONResponse({
+            "success": True,
+            "message": "Google Calendar disconnected"
+        })
+        
+    except Exception as e:
+        logging.error(f"Error disconnecting Google Calendar: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/google/events")
+async def get_google_calendar_events(
+    from_date: str = Query(None),
+    to_date: str = Query(None),
+    user=Depends(get_current_user)
+):
+    """
+    Get events from user's Google Calendar
+    """
+    try:
+        
+        
+        # Get user's credentials
+        credentials = db.get_google_credentials(user["id"])
+        
+        if not credentials:
+            raise HTTPException(
+                status_code=401,
+                detail="Google Calendar not connected. Please connect first."
+            )
+        
+        gcal = GoogleCalendarService(credentials)
+        
+        time_min = datetime.fromisoformat(from_date) if from_date else datetime.now(timezone.utc)
+        time_max = datetime.fromisoformat(to_date) if to_date else None
+        
+        events = gcal.list_events(time_min=time_min, time_max=time_max)
+        
+        updated_creds = gcal.get_updated_credentials()
+        if updated_creds['access_token'] != credentials['access_token']:
+            db.save_google_credentials(user["id"], **updated_creds)
+        
+        return JSONResponse({
+            "success": True,
+            "count": len(events),
+            "events": jsonable_encoder(events)
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error fetching Google Calendar events: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+@router.get("/agent/get-google-credentials/{user_id}")
+async def get_user_google_credentials(user_id: int):
+    """
+    Internal endpoint for agent to get user's Google credentials
+    """
+    try:
+        credentials = db.get_google_credentials(user_id)
+        
+        if not credentials:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Google Calendar not connected"}
+            )
+        
+        return JSONResponse({
+            "success": True,
+            "credentials": {
+                "access_token": credentials["access_token"],
+                "refresh_token": credentials["refresh_token"],
+                "token_expiry": credentials["token_expiry"].isoformat() if credentials["token_expiry"] else None,
+                "scopes": credentials["scopes"]
+            }
+        })
+        
+    except Exception as e:
+        logging.error(f"Error getting credentials: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+
+@router.get("/agent/get-google-appointments/{user_id}")
+async def get_google_appointments_for_agent(
+    user_id: int,
+    date: str = Query(None)
+):
+    """
+    API for agent to get appointments from Google Calendar
+    """
+    try:
+        
+        
+        # Get credentials
+        credentials = db.get_google_credentials(user_id)
+        
+        if not credentials:
+            return JSONResponse({
+                "success": False,
+                "appointments": [],
+                "message": "Google Calendar not connected"
+            })
+        
+        # Initialize service
+        gcal = GoogleCalendarService(credentials)
+        
+        # Parse date or use today
+        if date:
+            target_date = datetime.fromisoformat(date).replace(tzinfo=timezone.utc)
+        else:
+            target_date = datetime.now(timezone.utc)
+        
+        # Get events for the specific date
+        start_of_day = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = target_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
+        events = gcal.list_events(time_min=start_of_day, time_max=end_of_day)
+        
+        # Format for agent
+        appointments = [
+            {
+                "id": event["id"],
+                "date": event["date"],
+                "start_time": event["start_time"],
+                "end_time": event["end_time"],
+                "title": event["summary"],
+                "description": event.get("description", ""),
+                "location": event.get("location", "")
+            }
+            for event in events
+        ]
+        
+        updated_creds = gcal.get_updated_credentials()
+        if updated_creds['access_token'] != credentials['access_token']:
+            db.save_google_credentials(user_id, **updated_creds)
+        
+        return JSONResponse({
+            "success": True,
+            "appointments": appointments,
+            "count": len(appointments)
+        })
+        
+    except Exception as e:
+        logging.error(f"Error getting Google appointments: {e}")
+        traceback.print_exc()
+        return JSONResponse({
+            "success": False,
+            "appointments": [],
+            "error": str(e)
+        })
+
+
+@router.post("/agent/book-google-appointment")
+async def book_google_appointment_for_agent(request: Request):
+    """
+    API for agent to book appointment in Google Calendar
+    """
+    try:
+        from src.services.google_calendar_service import GoogleCalendarService
+        
+        data = await request.json()
+        
+        user_id = data.get("user_id")
+        appointment_date = data.get("appointment_date")
+        start_time = data.get("start_time")
+        end_time = data.get("end_time")
+        title = data.get("title", "Appointment")
+        description = data.get("description", "")
+        location = data.get("location", "")
+        attendee_name = data.get("attendee_name", "")
+        organizer_email = data.get("organizer_email")
+        
+        # Validate required fields
+        if not all([user_id, appointment_date, start_time, end_time]):
+            return error_response("Missing required fields", status_code=400)
+        
+        # Get user's Google credentials
+        credentials = db.get_google_credentials(user_id)
+        
+        if not credentials:
+            return error_response(
+                "Google Calendar not connected. Please connect first.",
+                status_code=401
+            )
+        
+        gcal = GoogleCalendarService(credentials)
+        
+        date_obj = datetime.fromisoformat(appointment_date)
+        start_hour, start_min = map(int, start_time.split(':'))
+        end_hour, end_min = map(int, end_time.split(':'))
+        
+        start_datetime = date_obj.replace(hour=start_hour, minute=start_min, tzinfo=timezone.utc)
+        end_datetime = date_obj.replace(hour=end_hour, minute=end_min, tzinfo=timezone.utc)
+        
+        is_available = gcal.check_availability(start_datetime, end_datetime)
+        
+        if not is_available:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "message": "Time slot already booked in Google Calendar",
+                    "conflict": True
+                }
+            )
+        
+        # Create event in Google Calendar
+        attendees = [organizer_email] if organizer_email else []
+        
+        event = gcal.create_event(
+            summary=title,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            description=description,
+            location=location,
+            attendees=attendees
+        )
+        
+        # Also save to local database as backup
+        db.create_appointment(
+            user_id=user_id,
+            appointment_date=appointment_date,
+            start_time=start_time,
+            end_time=end_time,
+            attendee_name=attendee_name,
+            attendee_email=organizer_email or "",
+            title=title,
+            description=description
+        )
+        
+        # Update credentials if refreshed
+        updated_creds = gcal.get_updated_credentials()
+        if updated_creds['access_token'] != credentials['access_token']:
+            db.save_google_credentials(user_id, **updated_creds)
+        
+        logging.info(f" Appointment booked in Google Calendar: {event['id']}")
+        
+        return JSONResponse({
+            "success": True,
+            "google_event_id": event["id"],
+            "message": "Appointment booked successfully in Google Calendar"
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error booking Google appointment: {e}")
+        traceback.print_exc()
+        return error_response(
+            f"Failed to book appointment: {str(e)}",
+            status_code=500
+        )
+    
+
+@router.post("/forgot-password")
+async def forgot_password(request: ForgotPasswordRequest):
+    """Send password reset email"""
+    try:
+        email = request.email.strip().lower()
+        
+        # Use the context manager pattern
+        with db.conn() as (conn, cursor):
+            cursor.execute("SELECT id FROM users WHERE email = %s", (email,))
+            user = cursor.fetchone()
+        
+        if not user:
+            logging.warning(f"Password reset requested for non-existent email: {email}")
+            return JSONResponse({
+                "success": True,
+                "message": "If that email exists, a reset link has been sent."
+            })
+        
+        from src.utils.jwt_utils import create_password_reset_token
+        reset_token = create_password_reset_token(email)
+        
+        frontend_url = os.getenv("FRONTEND_URL")
+        email_sent = await mail_obj.send_password_reset_email(email, reset_token, frontend_url)
+        
+        return JSONResponse({
+            "success": True,
+            "message": "If that email exists, a reset link has been sent."
+        })
+        
+    except Exception as e:
+        logging.error(f"Error in forgot password: {e}")
+        traceback.print_exc()
+        return error_response("Failed to process request", 500)
+
+@router.post("/reset-password")
+async def reset_password(request: ResetPasswordRequest):
+    """Reset password using token"""
+    try:
+        from src.utils.jwt_utils import verify_password_reset_token
+        
+        email = verify_password_reset_token(request.token)
+        
+        if not email:
+            return error_response("Invalid or expired reset token", 400)
+        
+        # Update password
+        db.update_user_password(email, request.new_password)
+        
+        return JSONResponse({
+            "success": True,
+            "message": "Password updated successfully. You can now login."
+        })
+        
+    except ValueError as e:
+        return error_response(str(e), 400)
+    except Exception as e:
+        logging.error(f"Error resetting password: {e}")
+        traceback.print_exc()
+        return error_response("Failed to reset password", 500)

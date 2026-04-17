@@ -12,7 +12,9 @@ import traceback
 from botocore.config import Config
 
 from datetime import datetime, timezone, timedelta
-from livekit import api
+#
+# LiveKit removed (Retell is calling provider)
+#
 
 # AWS imports (replacing GCS)
 import boto3
@@ -39,6 +41,7 @@ def get_s3_client():
         aws_secret_access_key=aws_secret_key,
         region_name=aws_region
     )
+
 
 
 def get_current_user(token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
@@ -140,28 +143,9 @@ def add_call_event(call_id: str, event_type: str, event_data: dict = None):
         traceback.print_exc()
 
 
-async def get_livekit_call_status(call_id: str):
-    """Get current status from LiveKit API"""
-    try:
-        lkapi = api.LiveKitAPI(
-            url=os.getenv("LIVEKIT_URL", "").replace("wss://", "https://"),
-            api_key=os.getenv("LIVEKIT_API_KEY"),
-            api_secret=os.getenv("LIVEKIT_API_SECRET"),
-        )
-        
-        room_info = await lkapi.room.list_rooms(api.ListRoomsRequest())
-        room_exists = any(room.name == call_id for room in room_info.rooms)
-        
-        await lkapi.aclose()
-        
-        if room_exists:
-            return {"status": "active", "message": "Call is in progress"}
-        else:
-            return {"status": "ended", "message": "Room not found"}
-            
-    except Exception as e:
-        logging.error(f"Error checking LiveKit: {e}")
-        return {"status": "unknown", "error": str(e)}
+#
+# LiveKit status helper removed.
+#
 
 
 async def fetch_and_store_transcript(call_id: str, transcript_url: str = None, transcript_blob: str = None):

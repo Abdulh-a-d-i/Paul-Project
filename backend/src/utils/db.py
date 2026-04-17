@@ -70,10 +70,11 @@ class PGDB:
         self.create_appointments_table()
         self.create_user_prompts_table()
         self.create_contacts_table()
+        self.create_voices_table()
+        self.create_google_credentials_table()
 
         self._initialized = True
 
-    # ------------- Connection helpers -----------------
     def _connect_fresh(self):
         """Create a new psycopg2 connection (fresh, not pooled)."""
         # psycopg2 will accept connection params in the dsn (e.g. keepalives) if present.
@@ -578,6 +579,10 @@ class PGDB:
                         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                         call_id TEXT NOT NULL UNIQUE,
                         status TEXT,
+                        call_outcome_status TEXT,
+                        contact_first_name TEXT,
+                        contact_email TEXT,
+                        category TEXT,
                         duration DOUBLE PRECISION,
                         transcript JSONB,
                         summary TEXT,
@@ -599,6 +604,11 @@ class PGDB:
                 # Add indexes if missing (idempotent)
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_call_history_events_log ON call_history USING GIN (events_log);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_call_history_agent_events ON call_history USING GIN (agent_events);")
+                # Idempotent column backfills (in case table already existed)
+                cursor.execute("ALTER TABLE call_history ADD COLUMN IF NOT EXISTS call_outcome_status TEXT;")
+                cursor.execute("ALTER TABLE call_history ADD COLUMN IF NOT EXISTS contact_first_name TEXT;")
+                cursor.execute("ALTER TABLE call_history ADD COLUMN IF NOT EXISTS contact_email TEXT;")
+                cursor.execute("ALTER TABLE call_history ADD COLUMN IF NOT EXISTS category TEXT;")
                 conn.commit()
             except Exception as e:
                 logging.error(f"Error creating call_history table: {e}")
@@ -813,7 +823,11 @@ class PGDB:
         status: str = None,
         voice_id: str = None,
         voice_name: str = None,
-        to_number: str = None
+        to_number: str = None,
+        contact_first_name: str = None,
+        contact_email: str = None,
+        category: str = None,
+        call_outcome_status: str = None
     ):
         """
         Insert a new call history record with initial data.
@@ -823,14 +837,16 @@ class PGDB:
             try:
                 values = (
                     user_id, call_id, status,
-                    voice_id, voice_name, to_number
+                    voice_id, voice_name, to_number,
+                    contact_first_name, contact_email, category, call_outcome_status
                 )
                 cursor.execute("""
                     INSERT INTO call_history (
                         user_id, call_id, status,
-                        voice_id, voice_name, to_number
+                        voice_id, voice_name, to_number,
+                        contact_first_name, contact_email, category, call_outcome_status
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     RETURNING id;
                 """, values)
                 row = cursor.fetchone()
@@ -916,9 +932,13 @@ class PGDB:
                     SELECT ch.id, ch.call_id, ch.status, ch.duration, ch.transcript,
                         ch.summary, ch.recording_url, ch.created_at, ch.started_at, ch.ended_at,
                         ch.voice_id, ch.voice_name, ch.from_number, ch.to_number,
+                        ch.contact_first_name, ch.contact_email, ch.category, ch.call_outcome_status,
+                        c.call_status AS contact_call_status,
                         ch.recording_blob,  -- ✅ ADD THIS
                         u.id AS user_id, u.username, u.email
                     FROM call_history ch
+                    LEFT JOIN contacts c
+                        ON c.user_id = ch.user_id AND c.phone_number = ch.to_number
                     JOIN users u ON ch.user_id = u.id
                     WHERE ch.user_id = %s
                     ORDER BY ch.created_at DESC
@@ -944,6 +964,27 @@ class PGDB:
                 }
             except Exception as e:
                 logging.error(f"Error fetching call history for user_id={user_id}: {e}")
+                raise
+
+    def get_call_outcome_summary(self, user_id: int) -> dict:
+        """Aggregate counts of call_outcome_status for a user."""
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute(
+                    """
+                    SELECT
+                        COALESCE(call_outcome_status, 'unspecified') AS status,
+                        COUNT(*)
+                    FROM call_history
+                    WHERE user_id = %s
+                    GROUP BY COALESCE(call_outcome_status, 'unspecified')
+                    """,
+                    (user_id,)
+                )
+                rows = cursor.fetchall()
+                return {row[0]: row[1] for row in rows}
+            except Exception as e:
+                logging.error(f"Error getting call outcome summary: {e}")
                 raise
 
     def create_appointment(
@@ -1214,11 +1255,13 @@ class PGDB:
                         call_status VARCHAR(50) DEFAULT 'pending',
                         uploaded_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE(user_id, phone_number) -- Prevent duplicate phone numbers per user
                     );
                    
                     CREATE INDEX IF NOT EXISTS idx_contacts_user_id ON contacts(user_id);
                     CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts(phone_number);
+                    ALTER TABLE contacts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;
                 """)
                 conn.commit()
                 logging.info("✅ contacts table created/updated")
@@ -1318,6 +1361,25 @@ class PGDB:
                 conn.rollback()
                 logging.error(f"Bulk insert error: {e}")
                 traceback.print_exc()
+                raise
+
+    def update_contact_status(self, user_id: int, phone_number: str, status: str):
+        """Update contact call_status by phone number for a user (idempotent)."""
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute(
+                    """
+                    UPDATE contacts
+                    SET call_status = %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = %s AND phone_number = %s
+                    """,
+                    (status, user_id, phone_number)
+                )
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"Error updating contact status: {e}")
                 raise
 
     def create_prompt(self, user_id: int, prompt_name: str, system_prompt: str) -> dict:
@@ -1517,4 +1579,240 @@ class PGDB:
             except Exception as e:
                 conn.rollback()
                 logging.error(f"Error setting default: {e}")
+                raise
+
+
+    def create_voices_table(self):
+        """
+        Create a global voices table accessible by all users.
+        Any user can add voices, and all users can see them.
+        """
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS voices (
+                        id SERIAL PRIMARY KEY,
+                        voice_name VARCHAR(255) NOT NULL UNIQUE,
+                        voice_id VARCHAR(255) NOT NULL UNIQUE,
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_voices_name ON voices(voice_name);
+                """)
+                conn.commit()
+                logging.info("✅ voices table created/updated")
+            except Exception as e:
+                logging.error(f"Error creating voices table: {e}")
+                raise
+
+    
+
+    def get_voice_by_name(self, voice_name: str) -> dict:
+        """
+        Get voice details by name (case-insensitive).
+        
+        Returns:
+            dict with voice_id and voice_name, or None if not found
+        """
+        with self.conn() as (conn, cursor):
+            try:
+                cursor.execute("""
+                    SELECT voice_id, voice_name
+                    FROM voices
+                    WHERE LOWER(voice_name) = LOWER(%s);
+                """, (voice_name.strip(),))
+                return cursor.fetchone()
+            except Exception as e:
+                logging.error(f"Error fetching voice by name: {e}")
+                raise
+
+    
+
+
+    def add_voice(self, voice_name: str, voice_id: str) -> dict:
+        """
+        Add a new voice to the global voices library.
+        
+        Args:
+            voice_name: Display name for the voice (e.g., "Sam Elliott")
+            voice_id: ElevenLabs voice ID
+        
+        Returns:
+            dict with voice data
+        """
+        with self.conn() as (conn, cursor):
+            try:
+                cursor.execute("""
+                    INSERT INTO voices (voice_name, voice_id)
+                    VALUES (%s, %s)
+                    RETURNING voice_name, voice_id;
+                """, (voice_name.strip(), voice_id.strip()))
+                
+                result = cursor.fetchone()
+                conn.commit()
+                logging.info(f"✅ Added voice '{voice_name}'")
+                return result
+            except Exception as e:
+                conn.rollback()
+                if "unique" in str(e).lower():
+                    raise ValueError(f"Voice name or ID already exists")
+                logging.error(f"Error adding voice: {e}")
+                raise
+
+    def get_all_voices(self) -> list:
+        """
+        Get all voices from the global library.
+        
+        Returns:
+            List of dicts with: voice_name, voice_id
+        """
+        with self.conn() as (conn, cursor):
+            try:
+                cursor.execute("""
+                    SELECT voice_name, voice_id
+                    FROM voices
+                    ORDER BY voice_name ASC;
+                """)
+                return cursor.fetchall()
+            except Exception as e:
+                logging.error(f"Error fetching voices: {e}")
+                raise
+
+    def delete_voice(self, voice_id: str) -> bool:
+        """
+        Delete a voice by voice_id (the ElevenLabs ID, not database id).
+        """
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute("""
+                    DELETE FROM voices WHERE voice_id = %s
+                """, (voice_id,))
+                conn.commit()
+                logging.info(f"✅ Deleted voice with ID {voice_id}")
+                return True
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"Error deleting voice: {e}")
+                raise
+
+    def create_google_credentials_table(self):
+        """
+        Create table to store Google OAuth tokens for each user
+        """
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS google_credentials (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        access_token TEXT NOT NULL,
+                        refresh_token TEXT,
+                        token_expiry TIMESTAMPTZ,
+                        scopes TEXT[],
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(user_id)
+                    );
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_google_credentials_user_id 
+                    ON google_credentials(user_id);
+                """)
+                conn.commit()
+                logging.info("✅ google_credentials table created")
+            except Exception as e:
+                logging.error(f"Error creating google_credentials table: {e}")
+
+    def save_google_credentials(
+        self,
+        user_id: int,
+        access_token: str,
+        refresh_token: str = None,
+        token_expiry: datetime = None,
+        scopes: list = None
+    ):
+        """Save or update Google OAuth credentials for user"""
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute("""
+                    INSERT INTO google_credentials 
+                    (user_id, access_token, refresh_token, token_expiry, scopes)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id) 
+                    DO UPDATE SET
+                        access_token = EXCLUDED.access_token,
+                        refresh_token = COALESCE(EXCLUDED.refresh_token, google_credentials.refresh_token),
+                        token_expiry = EXCLUDED.token_expiry,
+                        scopes = EXCLUDED.scopes,
+                        updated_at = CURRENT_TIMESTAMP
+                    RETURNING id;
+                """, (user_id, access_token, refresh_token, token_expiry, scopes))
+                conn.commit()
+                logging.info(f"✅ Saved Google credentials for user {user_id}")
+                return cursor.fetchone()[0]
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"Error saving Google credentials: {e}")
+                raise
+
+    def get_google_credentials(self, user_id: int):
+        """Get Google OAuth credentials for user"""
+        with self.conn() as (conn, cursor):
+            try:
+                cursor.execute("""
+                    SELECT access_token, refresh_token, token_expiry, scopes
+                    FROM google_credentials
+                    WHERE user_id = %s
+                """, (user_id,))
+                return cursor.fetchone()
+            except Exception as e:
+                logging.error(f"Error getting Google credentials: {e}")
+                return None
+
+    def delete_google_credentials(self, user_id: int):
+        """Remove Google OAuth credentials (disconnect calendar)"""
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute("""
+                    DELETE FROM google_credentials WHERE user_id = %s
+                """, (user_id,))
+                conn.commit()
+                logging.info(f"✅ Deleted Google credentials for user {user_id}")
+                return True
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"Error deleting Google credentials: {e}")
+                raise
+
+
+    def update_user_password(self, email: str, new_password: str):
+        """
+        Update user password by email (used for password reset)
+        """
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                # Hash new password
+                new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
+                
+                # Update by email
+                cursor.execute("""
+                    UPDATE users 
+                    SET password_hash = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE email = %s
+                    RETURNING id
+                """, (new_hash, email))
+                
+                result = cursor.fetchone()
+                
+                if not result:
+                    raise ValueError("User not found")
+                
+                conn.commit()
+                logging.info(f"✅ Password updated for {email}")
+                return True
+                
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"Password update error: {e}")
                 raise

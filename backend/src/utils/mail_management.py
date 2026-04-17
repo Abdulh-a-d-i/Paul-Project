@@ -13,6 +13,35 @@ class Send_Mail:
         self.EMAIL_PASSWORD = "gqty jnji ufjq rgrh"
         self.TIMEZONE = "America/New_York"
 
+    async def send_email(self, to_email: str, subject: str, html_body: str, plain_body: str = None):
+        """
+        Generic email sending method
+        """
+        try:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"] = self.MAIL_SENDER
+            msg["To"] = to_email
+            
+            # Add plain text version
+            if plain_body:
+                msg.attach(MIMEText(plain_body, "plain"))
+            
+            # Add HTML version
+            msg.attach(MIMEText(html_body, "html"))
+            
+            # Send email
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(self.MAIL_SENDER, self.EMAIL_PASSWORD)
+                server.send_message(msg)
+            
+            logging.info(f"✅ Email sent to {to_email}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"❌ Error sending email: {e}")
+            return False
+
     async def send_email_with_calendar_event(
         self,
         attendee_email: str,
@@ -119,4 +148,53 @@ END:VCALENDAR
 
         except Exception as e:
             logging.error(f"❌ Error sending email with calendar event: {e}")
+            return False
+
+    async def send_password_reset_email(self, email: str, reset_token: str, frontend_url: str = "https://backend.joinironfathers.com"):
+        """Send password reset email with token"""
+        try:
+            reset_link = f"{frontend_url}/reset-password?token={reset_token}"
+            
+            subject = "Password Reset Request"
+            
+            html_body = f"""
+            <html>
+                <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                    <h2 style="color: #333;">Password Reset Request</h2>
+                    <p>You requested to reset your password. Click the button below to proceed:</p>
+                    
+                    <a href="{reset_link}"
+                       style="display: inline-block; padding: 12px 24px; background-color: #007bff;
+                              color: white; text-decoration: none; border-radius: 4px; margin: 20px 0;">
+                        Reset Password
+                    </a>
+                    
+                    <p style="color: #666; font-size: 14px;">
+                        This link will expire in 1 hour for security reasons.
+                    </p>
+                    
+                    <p style="color: #666; font-size: 14px;">
+                        If you didn't request this, please ignore this email.
+                    </p>
+                    
+                    <hr style="border: 1px solid #eee; margin: 30px 0;">
+                    <p style="color: #999; font-size: 12px;">
+                        If the button doesn't work, copy and paste this link:<br>
+                        {reset_link}
+                    </p>
+                </body>
+            </html>
+            """
+            
+            plain_body = (
+                f"You requested to reset your password.\n\n"
+                f"Reset link: {reset_link}\n\n"
+                f"This link will expire in 1 hour.\n"
+                f"If you didn't request this, ignore this email."
+            )
+            
+            return await self.send_email(email, subject, html_body, plain_body)
+            
+        except Exception as e:
+            logging.error(f"❌ Failed to send reset email: {e}")
             return False

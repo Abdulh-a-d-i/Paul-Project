@@ -1,1 +1,0 @@
-# BlandAI_Artificizen

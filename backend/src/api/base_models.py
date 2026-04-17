@@ -65,7 +65,13 @@ class Assistant_Payload(BaseModel):
     language: str 
     voice: str 
 
+class AddVoiceRequest(BaseModel):
+    voice_name: str
+    voice_id: str
 
+class VoiceResponse(BaseModel):
+    voice_name: str
+    voice_id: str
 
 class PromptCustomizationUpdate(BaseModel):
     system_prompt: str = Field(..., min_length=1, max_length=1000000)
@@ -107,6 +113,10 @@ class BulkCallPayload(BaseModel):
     system_prompt: str = Field(..., min_length=1, description="The complete system prompt to use")
     voice: str = Field(default="david", description="Voice name (david, ravi, emily-british, etc.)")
     language: str = Field(default="en", description="Language code (en or es)")
+    first_name: Optional[str] = Field(default=None, description="Fallback contact first name applied to all numbers")
+    first_names: Optional[List[Optional[str]]] = Field(default=None, description="Per-number first names aligned with phone_numbers")
+    email: Optional[str] = Field(default=None, description="Target contact email for calendar invites/SMS")
+    category: Optional[str] = Field(default=None, description="Call category (e.g., 'appt_setting', 'lead_gen')")
     
     @validator('phone_numbers')
     def validate_phone_numbers(cls, v):
@@ -124,6 +134,26 @@ class BulkCallPayload(BaseModel):
         
         return cleaned
 
+    @validator('first_names')
+    def validate_first_names(cls, v, values, **kwargs):
+        if v is None:
+            return v
+        phone_numbers = values.get('phone_numbers') or []
+        if phone_numbers and len(v) not in (0, len(phone_numbers)):
+            raise ValueError("first_names must match phone_numbers length or be omitted")
+        # Normalize blanks to None
+        return [name.strip() if name and name.strip() else None for name in v]
+
+    @validator('category')
+    def normalize_category(cls, v):
+        if not v:
+            return None
+        v_clean = v.strip().lower()
+        allowed = {"appt setting", "appt_setting", "appointment", "lead gen", "lead_gen", "leadgen"}
+        if v_clean not in allowed:
+            return v_clean  # keep flexible but normalized to lower
+        return v_clean
+
 
 class SingleCallPayload(BaseModel):
     """
@@ -136,9 +166,12 @@ class SingleCallPayload(BaseModel):
     system_prompt: str = Field(..., min_length=1, description="The complete system prompt to use")
     voice: str = Field(default="david", description="Voice name")
     language: str = Field(default="en", description="Language code")
+    first_name: Optional[str] = Field(default=None, description="Target contact first name to personalize the call")
+    email: Optional[str] = Field(default=None, description="Target contact email")
+    category: Optional[str] = Field(default=None, description="Call category (appt_setting, lead_gen, etc.)")
 
 
-
+ 
 class CreatePromptRequest(BaseModel):
     """Request to create a new prompt"""
     prompt_name: str = Field(..., min_length=1, max_length=255, description="Name/heading for the prompt")
@@ -169,3 +202,10 @@ class BulkCallResponse(BaseModel):
     total_calls: int
     initiated_calls: List[dict] 
     failed_calls: List[dict] 
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str = Field(..., min_length=8)
