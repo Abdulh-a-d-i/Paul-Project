@@ -1042,28 +1042,96 @@ class PGDB:
                         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                     );
                 """)
+                cursor.execute(
+                    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS notes TEXT;"
+                )
                 conn.commit()
             except Exception as e:
                 logging.error(f"Error creating appointments table: {e}")
 
-    def get_user_appointments(self, user_id: int, from_date: str = None):
-        """Get all appointments for a user from a specific date onwards"""
-        if from_date is None:
-            from_date = datetime.now().strftime("%Y-%m-%d")
-       
-        query = """
-            SELECT id, appointment_date, start_time, end_time, attendee_email,
-                attendee_name, title, description, status, created_at
-            FROM appointments
-            WHERE user_id = %s AND appointment_date >= %s
-            ORDER BY appointment_date, start_time
-        """
+    def get_user_appointments(self, user_id: int, from_date: str = None, all_time: bool = False):
+        """Get appointments for a user. When all_time is True, return every row for that user."""
         with self.conn() as (conn, cursor):
             try:
-                cursor.execute(query, (user_id, from_date))
+                if all_time:
+                    cursor.execute(
+                        """
+                        SELECT id, appointment_date, start_time, end_time, attendee_email,
+                            attendee_name, title, description, status, notes, created_at
+                        FROM appointments
+                        WHERE user_id = %s
+                        ORDER BY appointment_date DESC, start_time DESC
+                        """,
+                        (user_id,),
+                    )
+                else:
+                    if from_date is None:
+                        from_date = datetime.now().strftime("%Y-%m-%d")
+                    cursor.execute(
+                        """
+                        SELECT id, appointment_date, start_time, end_time, attendee_email,
+                            attendee_name, title, description, status, notes, created_at
+                        FROM appointments
+                        WHERE user_id = %s AND appointment_date >= %s
+                        ORDER BY appointment_date, start_time
+                        """,
+                        (user_id, from_date),
+                    )
                 return cursor.fetchall()
             except Exception as e:
                 logging.error(f"Error getting appointments: {e}")
+                raise
+
+    def get_contact_call_status_by_phone(self, user_id: int, phone: str) -> Optional[str]:
+        """
+        Return contacts.call_status for this user/phone, or None if no matching contact.
+        Phone may be E.164 or raw digits; matches stored phone_number flexibly.
+        """
+        d = "".join(c for c in (phone or "") if c.isdigit())
+        if not d:
+            return None
+        variants = {d}
+        if len(d) == 11 and d.startswith("1"):
+            variants.add(d[1:])
+        if len(d) >= 10:
+            variants.add(d[-10:])
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute(
+                    """
+                    SELECT call_status FROM contacts
+                    WHERE user_id = %s AND phone_number = ANY(%s)
+                    LIMIT 1
+                    """,
+                    (user_id, list(variants)),
+                )
+                row = cursor.fetchone()
+                return row[0] if row else None
+            except Exception as e:
+                logging.error(f"Error get_contact_call_status_by_phone: {e}")
+                raise
+
+    def list_all_appointments_admin(self, limit: int = 500):
+        """All appointments with owning user (for admin dashboard only)."""
+        lim = max(1, min(int(limit), 2000))
+        with self.conn() as (conn, cursor):
+            try:
+                cursor.execute(
+                    """
+                    SELECT a.id, a.user_id, a.appointment_date, a.start_time, a.end_time,
+                        a.attendee_email, a.attendee_name, a.title, a.description, a.status,
+                        a.notes, a.created_at,
+                        u.email AS owner_email, u.username AS owner_username
+                    FROM appointments a
+                    JOIN users u ON u.id = a.user_id
+                    ORDER BY a.appointment_date DESC, a.start_time DESC
+                    LIMIT %s
+                    """,
+                    (lim,),
+                )
+                return cursor.fetchall()
+            except Exception as e:
+                logging.error(f"Error list_all_appointments_admin: {e}")
                 raise
 
     def check_appointment_conflict(

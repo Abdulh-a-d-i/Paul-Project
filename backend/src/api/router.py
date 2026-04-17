@@ -1,12 +1,9 @@
 import json
 import logging
 import os
-import io
 
 import traceback
-from datetime import datetime, timedelta,timezone
-from typing import Dict, List, Optional, Tuple, Any
-import requests
+from datetime import datetime, timezone
 import asyncio
 from dotenv import load_dotenv
 from fastapi import (
@@ -16,59 +13,36 @@ from fastapi import (
     Query,
     Request,
 )
-from datetime import datetime
-from src.services.google_calendar_service import GoogleCalendarService
-
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
-from fastapi.security import OAuth2PasswordRequestForm
-from fastapi import HTTPException, Response, UploadFile, File
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import HTTPException, Response
 from rich import print
 from src.api.base_models import (
     UserLogin,
     UserRegister,
-    UserOut,
     LoginResponse,
-    UpdateUserProfileRequest,
-    Assistant_Payload,
-    PromptCustomizationUpdate,
-    ContactsListResponse,
-    ContactUploadResponse,
-    ContactUploadResponse,
-    ContactUploadStats,
-    BulkCallResponse,
-    PromptResponse,
-    UpdatePromptRequest,
-    CreatePromptRequest,
-    SingleCallPayload,
     BulkCallPayload,
-    AddVoiceRequest, 
-    VoiceResponse,
     ForgotPasswordRequest,
-    ResetPasswordRequest 
-
+    ResetPasswordRequest,
 )
 from src.utils.db import PGDB 
 from src.utils.mail_management import Send_Mail
 from src.utils.jwt_utils import create_access_token
-from src.utils.utils import get_current_user,add_call_event, generate_presigned_url,fetch_and_store_transcript,fetch_and_store_recording, calculate_duration, check_if_answered
+from src.utils.utils import (
+    get_current_user,
+    add_call_event,
+    generate_presigned_url,
+    fetch_and_store_transcript,
+    is_admin,
+)
 #
 # LiveKit removed (Retell is calling provider)
 #
-from src.models.System_Prompt import PromptBuilder
-import csv
-
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-from datetime import datetime
 from src.services.google_calendar_service import GoogleCalendarService
 from google_auth_oauthlib.flow import Flow
-from google.oauth2.credentials import Credentials
-import json
 from twilio.rest import Client
 from src.utils.retell_utils import (
-    verify_retell_signature,
     extract_retell_event_and_call,
     ms_epoch_to_datetime,
     build_transcript_snapshot,
@@ -90,6 +64,8 @@ GOOGLE_SCOPES = ['https://www.googleapis.com/auth/calendar']
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_MESSAGING_SERVICE_SID = os.getenv("TWILIO_MESSAGING_SERVICE_SID")
+# SMS when a prospect asks for the promo / explainer video (Retell tool → backend)
+PROMO_VIDEO_URL = (os.getenv("PROMO_VIDEO_URL") or os.getenv("SMS_VIDEO_LINK_URL") or "").strip()
 load_dotenv()
 
 router = APIRouter()
@@ -109,6 +85,26 @@ def error_response(message, status_code=400):
         content={"error": message}
     )
 
+def _send_twilio_sms(phone_number: str, message_body: str) -> bool:
+    """Send SMS via Twilio Messaging Service."""
+    try:
+        if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_MESSAGING_SERVICE_SID]):
+            logging.warning("⚠️ Twilio credentials not configured, skipping SMS")
+            return False
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        message = client.messages.create(
+            body=message_body,
+            messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
+            to=phone_number,
+        )
+        logging.info(f"✅ SMS sent to {phone_number} (SID: {message.sid})")
+        return True
+    except Exception as e:
+        logging.error(f"❌ Failed to send SMS: {e}")
+        traceback.print_exc()
+        return False
+
+
 def send_appointment_confirmation_sms(
     phone_number: str,
     appointment_date: str,
@@ -120,12 +116,6 @@ def send_appointment_confirmation_sms(
     Send SMS confirmation through Twilio Messaging Service (with A2P 10DLC campaign)
     """
     try:
-        if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_MESSAGING_SERVICE_SID]):
-            logging.warning("⚠️ Twilio credentials not configured, skipping SMS")
-            return False
-        
-        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        
         # Format date and time
         from datetime import datetime
         date_obj = datetime.strptime(appointment_date, "%Y-%m-%d")
@@ -146,16 +136,7 @@ Thank you for booking! We look forward to seeing you.
 
 Reply CANCEL to reschedule."""
         
-        # ⭐ Send through Messaging Service (automatically uses campaign)
-        message = client.messages.create(
-            body=message_body,
-            messaging_service_sid=TWILIO_MESSAGING_SERVICE_SID,
-            to=phone_number
-        )
-        
-        logging.info(f"✅ SMS sent via campaign to {phone_number} (SID: {message.sid})")
-        logging.info(f"   Campaign: Low Volume Mixed (CTYJ4B9)")
-        return True
+        return _send_twilio_sms(phone_number, message_body)
         
     except Exception as e:
         logging.error(f"❌ Failed to send SMS: {e}")
@@ -163,16 +144,27 @@ Reply CANCEL to reschedule."""
         return False
 
 
+def send_promo_video_link_sms(phone_number: str, video_url=None) -> bool:
+    """Send a short SMS with the promo video link (interest / follow-up)."""
+    url = (video_url or PROMO_VIDEO_URL or "").strip()
+    if not url:
+        logging.warning("PROMO_VIDEO_URL / SMS_VIDEO_LINK_URL not set; cannot send video SMS")
+        return False
+    body = (
+        f"Thanks for your interest — here's the video we mentioned:\n{url}\n\n"
+        "Reply STOP to opt out of messages."
+    )
+    return _send_twilio_sms(phone_number, body)
+
+
 @router.post("/retell-webhook")
 async def retell_webhook(request: Request):
     """
     Retell account webhook: persist call status/transcript/recording into call_history.
     Outbound project: no inbound routing webhook required.
+    Signature verification disabled; protect this URL at the network layer if exposed publicly.
     """
     raw_body = (await request.body()).decode("utf-8")
-    sig = request.headers.get("X-Retell-Signature")
-    if not verify_retell_signature(raw_body, sig):
-        raise HTTPException(status_code=401, detail="Invalid Retell signature")
     try:
         payload = json.loads(raw_body)
     except json.JSONDecodeError:
@@ -229,7 +221,7 @@ async def retell_webhook(request: Request):
         except Exception:
             pass
 
-    updates: dict[str, Any] = {
+    updates = {
         "status": (event or call.get("call_status") or call.get("status") or "connected"),
         "from_number": call.get("from_number"),
         "to_number": call.get("to_number"),
@@ -292,7 +284,7 @@ async def retell_flow_prompt_and_intro(body: dict, user=Depends(get_current_user
     intro_node_id = (body.get("intro_node_id") or "").strip() or None
     intro_text = body.get("intro_text")
 
-    updates: dict[str, Any] = {}
+    updates = {}
     if global_prompt is not None:
         updates["global_prompt"] = str(global_prompt)
 
@@ -302,7 +294,7 @@ async def retell_flow_prompt_and_intro(body: dict, user=Depends(get_current_user
         intro_id = intro_node_id or current.get("start_node_id")
         if not intro_id:
             raise HTTPException(status_code=400, detail="No intro node id available")
-        new_nodes: list[dict] = []
+        new_nodes = []
         found = False
         for n in nodes:
             if not isinstance(n, dict):
@@ -336,16 +328,16 @@ async def retell_voices(user=Depends(get_current_user)):
     agent = retell_get_agent(agent_id)
     voices = retell_list_voices()
 
-    def _norm(x: Any) -> str:
+    def _norm(x) -> str:
         return str(x or "").strip().lower()
 
-    def _is_11labs(v: dict) -> bool:
+    def _is_11labs(v) -> bool:
         vid = _norm(v.get("voice_id"))
         prov = _norm(v.get("provider"))
         return vid.startswith("11labs-") or prov in ("11labs", "elevenlabs")
 
     allowed_lang = {"en", "eng", "english", "es", "spa", "spanish"}
-    out: list[dict] = []
+    out = []
     for v in voices:
         if not isinstance(v, dict):
             continue
@@ -468,8 +460,9 @@ async def assistant_bulk_call_retell(
     if not from_number:
         raise HTTPException(status_code=500, detail="RETELL_FROM_NUMBER is not configured")
 
-    initiated_calls: list[dict] = []
-    failed_calls: list[dict] = []
+    initiated_calls = []
+    failed_calls = []
+    skipped_do_not_call = []
 
     # Fetch agent once for current voice_id (optional for DB/UI)
     agent = None
@@ -484,6 +477,16 @@ async def assistant_bulk_call_retell(
             phone = (to_number or "").strip()
             if not phone:
                 raise ValueError("empty phone number")
+
+            try:
+                cst = db.get_contact_call_status_by_phone(user["id"], phone)
+                if cst == "do_not_call":
+                    skipped_do_not_call.append(
+                        {"to_number": phone, "reason": "contact_marked_do_not_call"}
+                    )
+                    continue
+            except Exception as e:
+                logging.warning("DNC lookup failed for %s: %s", phone, e)
 
             contact_first_name = None
             if getattr(payload, "first_names", None) and len(payload.first_names) == len(payload.phone_numbers):
@@ -549,6 +552,8 @@ async def assistant_bulk_call_retell(
                 "total": len(payload.phone_numbers or []),
                 "initiated": len(initiated_calls),
                 "failed": len(failed_calls),
+                "skipped_do_not_call": len(skipped_do_not_call),
+                "skipped": skipped_do_not_call,
                 "calls": initiated_calls,
                 "errors": failed_calls,
             }
@@ -843,9 +848,67 @@ async def get_user_call_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/appointments")
+async def list_my_appointments(
+    from_date=Query(None),
+    all_time: bool = Query(True),
+    user=Depends(get_current_user),
+):
+    """
+    Appointments and bookings for the **logged-in user only** (JWT).
+    Admins do not see other users' data here; use GET /admin/appointments for a global view.
+    """
+    try:
+        rows = db.get_user_appointments(user["id"], from_date=from_date, all_time=all_time)
+        out = []
+        for apt in rows:
+            a = dict(apt) if not isinstance(apt, dict) else apt
+            out.append(
+                {
+                    "id": a.get("id"),
+                    "appointment_date": str(a.get("appointment_date")) if a.get("appointment_date") is not None else None,
+                    "start_time": str(a.get("start_time")) if a.get("start_time") is not None else None,
+                    "end_time": str(a.get("end_time")) if a.get("end_time") is not None else None,
+                    "attendee_email": a.get("attendee_email"),
+                    "attendee_name": a.get("attendee_name"),
+                    "title": a.get("title"),
+                    "description": a.get("description"),
+                    "notes": a.get("notes"),
+                    "status": a.get("status"),
+                    "created_at": a.get("created_at").isoformat()
+                    if hasattr(a.get("created_at"), "isoformat")
+                    else str(a.get("created_at"))
+                    if a.get("created_at")
+                    else None,
+                }
+            )
+        return JSONResponse(content=jsonable_encoder({"success": True, "appointments": out}))
+    except Exception as e:
+        logging.error(f"list_my_appointments: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/admin/appointments")
+async def list_appointments_admin(
+    limit: int = Query(500, ge=1, le=2000),
+    _admin=Depends(is_admin),
+):
+    """
+    All appointments across users (admin accounts only). `is_admin` on the user row must be true.
+    """
+    try:
+        rows = db.list_all_appointments_admin(limit=limit)
+        return JSONResponse(content=jsonable_encoder({"success": True, "appointments": rows}))
+    except Exception as e:
+        logging.error(f"list_appointments_admin: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/agent/get-appointments/{user_id}")
 async def get_appointments(user_id: int, from_date: str = None):
-    """API for LiveKit agent to get all appointments for checking conflicts"""
+    """API for voice agent tools: appointments for `user_id` (same id passed in Retell metadata). Not JWT-protected."""
     try:
         appointments = db.get_user_appointments(user_id, from_date)
         
@@ -941,7 +1004,6 @@ async def book_appointment(request: Request):
             if credentials:
                 logging.info("User has Google Calendar connected")
                 
-                from src.services.google_calendar_service import GoogleCalendarService
                 gcal = GoogleCalendarService(credentials)
                 
                 date_obj = datetime.fromisoformat(appointment_date)
@@ -1088,83 +1150,31 @@ async def save_call_data(request: Request):
 
 
 
-@router.post("/prompts")
-async def create_prompt(
-    request: Request,
-    user=Depends(get_current_user)
-):
-    """
-    Create a new named prompt.
-    
-    Body:
-    {
-        "prompt_name": "Sales Call Script",
-        "system_prompt": "You are a sales assistant..."
-    }
-    """
-    try:
-        data = await request.json()
-        
-        prompt_name = data.get("prompt_name", "").strip()
-        system_prompt = data.get("system_prompt", "").strip()
-        
-        if not prompt_name:
-            return error_response("prompt_name is required", status_code=400)
-        
-        if not system_prompt:
-            return error_response("system_prompt is required", status_code=400)
-        
-        if len(prompt_name) > 255:
-            return error_response("prompt_name too long (max 255 chars)", status_code=400)
-        
-        result = db.create_prompt(user["id"], prompt_name, system_prompt)
-        
-        return JSONResponse(content=jsonable_encoder({
-            "success": True,
-            "message": "Prompt created successfully",
-            "prompt": result
-        }), status_code=201)
-        
-    except ValueError as ve:
-        return error_response(str(ve), status_code=400)
-    except Exception as e:
-        logging.error(f"Error creating prompt: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 @router.get("/prompts")
-async def get_all_prompts(user=Depends(get_current_user)):
+async def list_saved_prompt_scripts(user=Depends(get_current_user)):
     """
-    Get all prompts for the current user with names and content.
-    
-    Returns:
-    {
-        "success": true,
-        "prompts": [
-            {
-                "id": 1,
-                "prompt_name": "Default Prompt",
-                "system_prompt": "...",
-                "is_default": true,
-                "created_at": "...",
-                "updated_at": "..."
-            },
-            ...
-        ]
-    }
+    Dashboard: list saved script rows (metadata only — no `system_prompt` body).
+    Fetch full text with GET /prompts/{prompt_id}.
     """
     try:
-        prompts = db.get_all_user_prompts(user["id"])
-        
-        return JSONResponse(content=jsonable_encoder({
-            "success": True,
-            "count": len(prompts),
-            "prompts": prompts
-        }))
-        
+        rows = db.get_all_user_prompts(user["id"])
+        slim = []
+        for p in rows:
+            d = dict(p) if not isinstance(p, dict) else p
+            slim.append(
+                {
+                    "id": d.get("id"),
+                    "prompt_name": d.get("prompt_name"),
+                    "is_default": d.get("is_default"),
+                    "created_at": d.get("created_at"),
+                    "updated_at": d.get("updated_at"),
+                }
+            )
+        return JSONResponse(
+            content=jsonable_encoder({"success": True, "count": len(slim), "prompts": slim})
+        )
     except Exception as e:
-        logging.error(f"Error fetching prompts: {e}")
+        logging.error(f"Error listing prompts: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1289,396 +1299,77 @@ async def set_default_prompt(
         raise HTTPException(status_code=500, detail=str(e))
     
 
-@router.get("/calls/{call_id}/recording")
-async def get_call_recording_url(
-    call_id: str,
-    user=Depends(get_current_user)
-):
+@router.post("/agent/send-video-link")
+async def agent_send_promo_video_sms(request: Request):
     """
-    Get presigned URL for call recording (valid for 1 hour).
-    Recording is stored in S3, not in DB.
+    Retell custom tool: when the prospect wants the video, send SMS with PROMO_VIDEO_URL
+    (or body `video_url` override). Uses Twilio Messaging Service like other SMS.
     """
-    try:
-        
-        # Get recording blob path from DB
-        with db.conn() as (conn, cursor):
-            cursor.execute("""
-                SELECT recording_blob
-                FROM call_history
-                WHERE call_id = %s AND user_id = %s
-            """, (call_id, user["id"]))
-            row = cursor.fetchone()
-        
-        if not row:
-            raise HTTPException(status_code=404, detail="Call not found")
-        
-        recording_blob = row["recording_blob"] if isinstance(row, dict) else row[0]
-        
-        if not recording_blob:
-            raise HTTPException(status_code=404, detail="No recording available")
-        
-        # Generate presigned URL (valid for 1 hour)
-        presigned_url = generate_presigned_url(recording_blob, expiration=3600)
-        
-        if not presigned_url:
-            raise HTTPException(status_code=500, detail="Failed to generate download URL")
-        
-        return JSONResponse({
-            "success": True,
-            "recording_url": presigned_url,
-            "expires_in": 3600,
-            "call_id": call_id
-        })
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Error getting recording URL: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-    
-
-    
-@router.get("/calls/{call_id}/transcript")
-async def get_call_transcript(call_id: str, user=Depends(get_current_user)):
-    """Get transcript for a specific call"""
-    try:
-        #  Use the context manager pattern
-        with db.conn() as (conn, cursor):
-            cursor.execute("""
-                SELECT transcript
-                FROM call_history
-                WHERE call_id = %s AND user_id = %s
-            """, (call_id, user["id"]))
-            row = cursor.fetchone()
-        
-        if not row or not row["transcript"]:
-            raise HTTPException(status_code=404, detail="Transcript not found")
-        
-        return JSONResponse({"transcript": row["transcript"]})
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Error fetching transcript: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    
-
-
-@router.post("/contacts/upload", response_model=ContactUploadResponse)
-async def upload_contacts_csv(
-    file: UploadFile = File(...),
-    user=Depends(get_current_user)
-):
-    """
-    Upload CSV file with contacts (name, phone, email)
-    Fast bulk insert - no row-by-row validation
-    """
-    try:
-        # Validate file type
-        if not file.filename.endswith('.csv'):
-            raise HTTPException(status_code=400, detail="File must be a CSV")
-        
-        # Read file content
-        content = await file.read()
-        decoded = content.decode('utf-8-sig')
-        csv_file = io.StringIO(decoded)
-        
-        # Parse CSV quickly
-        csv_reader = csv.DictReader(csv_file)
-        
-        # Build contact list (minimal validation)
-        contacts = []
-        for row in csv_reader:
-            # Get phone (flexible column names)
-            phone = (
-                row.get('Phone number') or 
-                row.get('phone_number') or 
-                row.get('phone') or 
-                row.get('Phone') or ""
-            ).strip()
-            
-            # Quick clean
-            phone = ''.join(c for c in phone if c.isdigit())
-            
-            # Skip if no phone or invalid length
-            if not phone or len(phone) < 10:
-                continue
-            
-            contacts.append({
-                "first_name": (row.get('First name') or row.get('first_name') or "").strip()[:100],
-                "last_name": (row.get('Last name') or row.get('last_name') or "").strip()[:100],
-                "phone_number": phone,
-                "email": (row.get('Email address') or row.get('email') or "").strip()[:255] or None
-            })
-        
-        if not contacts:
-            raise HTTPException(status_code=400, detail="No valid contacts found")
-        
-        # Use FAST bulk insert
-        stats = db.save_contacts_bulk(user["id"], contacts)
-        
-        return {
-            "success": True,
-            "message": f"Successfully processed {stats['inserted']} contacts",
-            "stats": {
-                "total_rows": len(contacts),
-                "inserted": stats['inserted'],
-                "duplicates": stats['duplicates'],
-                "skipped": 0,
-                "errors": 0
-            }
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Error uploading contacts: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/contacts")
-async def get_contacts_simple_list(user=Depends(get_current_user)):
-    """
-    Get all contacts (name + phone only) - fast, no pagination
-    Perfect for dropdown lists or quick display
-    """
-    try:
-        contacts = db.get_contacts_simple(user["id"])
-        
-        return JSONResponse({
-            "success": True,
-            "count": len(contacts),
-            "contacts": contacts
-        })
-        
-    except Exception as e:
-        logging.error(f"Error fetching simple contacts: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch contacts: {str(e)}"
-        )
-
-
-
-#
-# LiveKit webhook/status endpoints removed (Retell is the calling provider).
-#
-
-
-@router.post("/agent/report-event")
-async def receive_agent_event(request: Request):
     try:
         data = await request.json()
-        
-        call_id = data.get("call_id")
-        status = data.get("status")
-        timestamp = data.get("timestamp")
-        
-        if not call_id or not status:
-            return JSONResponse({"error": "Missing data"}, status_code=400)
-        
-        if status not in {"initialized", "dialing", "connected", "unanswered"}:
-            return JSONResponse({"error": "Invalid status"}, status_code=400)
-        
-        updates = {"status": status}
-        now = datetime.now(timezone.utc)
-        
-        # Set started_at on dialing or connected
-        if status in {"dialing", "connected"}:
-            #  FIXED: Use context manager
-            with db.conn() as (conn, cursor):
-                cursor.execute(
-                    "SELECT started_at FROM call_history WHERE call_id = %s",
-                    (call_id,)
-                )
-                row = cursor.fetchone()
-                if row:
-                    started = row.get("started_at") if isinstance(row, dict) else row[0]
-                    if not started:
-                        updates["started_at"] = now
-        
-        # Handle unanswered
-        if status == "unanswered":
-            updates["ended_at"] = now
-            updates["duration"] = 0
-        
-        db.update_call_history(call_id, updates)
-        
-        return JSONResponse({"success": True})
-        
-    except Exception as e:
-        logging.error(f"report-event error: {e}")
-        traceback.print_exc()
-        return JSONResponse({"error": str(e)}, status_code=500)
+        call_id = (data.get("call_id") or "").strip()
+        user_id_raw = data.get("user_id")
+        phone_number = (data.get("phone_number") or "").strip()
+        video_url = (data.get("video_url") or "").strip() or None
 
+        if not call_id or user_id_raw is None:
+            return JSONResponse(
+                {"success": False, "error": "call_id and user_id are required"},
+                status_code=400,
+            )
+        try:
+            user_id = int(user_id_raw)
+        except (TypeError, ValueError):
+            return JSONResponse({"success": False, "error": "invalid user_id"}, status_code=400)
 
-@router.post("/agent/update-call-outcome")
-async def update_call_outcome(request: Request):
-    """Allow the agent to mark call outcome (booked, call_again, do_not_call) and sync contacts."""
-    try:
-        data = await request.json()
-        call_id = data.get("call_id")
-        outcome = (data.get("status") or "").strip().lower()
-
-        allowed = {"booked", "call_again", "do_not_call"}
-        if not call_id or outcome not in allowed:
-            return JSONResponse({"error": "Invalid call_id or status"}, status_code=400)
-
-        # Fetch user + phone for contact sync
         with db.conn() as (conn, cursor):
             cursor.execute(
-                """
-                SELECT user_id, to_number
-                FROM call_history
-                WHERE call_id = %s
-                """,
-                (call_id,)
+                "SELECT user_id, to_number FROM call_history WHERE call_id = %s",
+                (call_id,),
             )
             row = cursor.fetchone()
 
         if not row:
-            return JSONResponse({"error": "Call not found"}, status_code=404)
+            return JSONResponse({"success": False, "error": "Call not found"}, status_code=404)
 
-        user_id = row.get("user_id") if isinstance(row, dict) else row[0]
-        to_number = row.get("to_number") if isinstance(row, dict) else row[1]
+        uid = row.get("user_id") if isinstance(row, dict) else row[0]
+        to_num = row.get("to_number") if isinstance(row, dict) else row[1]
+        if int(uid) != user_id:
+            return JSONResponse(
+                {"success": False, "error": "call does not belong to this user_id"},
+                status_code=403,
+            )
 
-        db.update_call_history(call_id, {"call_outcome_status": outcome})
+        dest = phone_number or (to_num or "").strip()
+        if not dest:
+            return JSONResponse(
+                {"success": False, "error": "No phone number on call; pass phone_number"},
+                status_code=400,
+            )
 
-        if user_id and to_number:
+        if not video_url and not PROMO_VIDEO_URL:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "error": "Configure PROMO_VIDEO_URL (or pass video_url in the request body).",
+                },
+                status_code=500,
+            )
+
+        ok = send_promo_video_link_sms(dest, video_url)
+        if ok:
             try:
-                db.update_contact_status(user_id, to_number, outcome)
+                add_call_event(call_id, "promo_video_sms_sent", {"to_number": dest})
             except Exception:
-                logging.warning("Unable to update contact status; continuing")
+                pass
+            return JSONResponse({"success": True, "sms_sent": True, "to_number": dest})
 
-        add_call_event(call_id, "call_outcome", {"status": outcome})
-
-        return JSONResponse({"success": True, "status": outcome})
+        return JSONResponse({"success": False, "error": "SMS send failed"}, status_code=500)
 
     except Exception as e:
-        logging.error(f"update_call_outcome error: {e}")
+        logging.error(f"agent_send_promo_video_sms: {e}")
         traceback.print_exc()
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-@router.get("/analytics/call-outcomes")
-async def get_call_outcomes_summary(user=Depends(get_current_user)):
-    """Return counts of call outcome statuses for the signed-in user."""
-    try:
-        summary = db.get_call_outcome_summary(user["id"])
-        return JSONResponse({"success": True, "summary": summary})
-    except Exception as e:
-        logging.error(f"analytics call outcomes error: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Failed to fetch call outcome analytics")
-    
-
-
-
-
-@router.post("/voices", response_model=VoiceResponse)
-async def add_new_voice(
-    request: Request,
-    user=Depends(get_current_user)
-):
-    """
-    Add a new voice to the global library.
-    
-    Body:
-    {
-        "voice_name": "Morgan Freeman",
-        "voice_id": "abc123xyz"
-    }
-    """
-    try:
-        data = await request.json()
-        
-        voice_name = data.get("voice_name", "").strip()
-        voice_id = data.get("voice_id", "").strip()
-        
-        if not voice_name:
-            return error_response("voice_name is required", status_code=400)
-        
-        if not voice_id:
-            return error_response("voice_id is required", status_code=400)
-        
-        if len(voice_name) > 255:
-            return error_response("voice_name too long (max 255 chars)", status_code=400)
-        
-        result = db.add_voice(voice_name, voice_id)
-        
-        return JSONResponse(content=jsonable_encoder({
-            "success": True,
-            "message": "Voice added successfully",
-            "voice": result
-        }), status_code=201)
-        
-    except ValueError as ve:
-        return error_response(str(ve), status_code=400)
-    except Exception as e:
-        logging.error(f"Error adding voice: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/voices")
-async def get_all_voices_list(user=Depends(get_current_user)):
-    """
-    Get all available voices from the global library.
-    
-    Returns:
-    {
-        "success": true,
-        "count": 15,
-        "voices": [
-            {
-                "voice_name": "Sam Elliott",
-                "voice_id": "1Le15oXwaOV6DjrgvGiL"
-            },
-            ...
-        ]
-    }
-    """
-    try:
-        voices = db.get_all_voices()
-        
-        return JSONResponse(content=jsonable_encoder({
-            "success": True,
-            "count": len(voices),
-            "voices": voices
-        }))
-        
-    except Exception as e:
-        logging.error(f"Error fetching voices: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.delete("/voices/{voice_id}")
-async def delete_voice_endpoint(
-    voice_id: str,
-    user=Depends(get_current_user)
-):
-    """
-    Delete a voice from the library by its voice_id.
-    """
-    try:
-        db.delete_voice(voice_id)
-        
-        return JSONResponse(content={
-            "success": True,
-            "message": "Voice deleted successfully"
-        })
-        
-    except Exception as e:
-        logging.error(f"Error deleting voice: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-    
-
-
-
-
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
 
 
 @router.get("/google/auth/status")
@@ -1986,8 +1677,6 @@ async def book_google_appointment_for_agent(request: Request):
     API for agent to book appointment in Google Calendar
     """
     try:
-        from src.services.google_calendar_service import GoogleCalendarService
-        
         data = await request.json()
         
         user_id = data.get("user_id")
