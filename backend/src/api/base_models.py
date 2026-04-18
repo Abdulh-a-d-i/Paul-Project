@@ -104,55 +104,49 @@ class ContactUploadResponse(BaseModel):
 
 class BulkCallPayload(BaseModel):
     """
-    Payload for bulk calling multiple phone numbers.
+    Retell outbound bulk dial: only numbers are required. Everything else is optional
+    metadata / retell_llm_dynamic_variables for the agent (voice & prompts come from Retell agent config).
     """
-    phone_numbers: List[str] = Field(..., min_items=1, description="List of phone numbers to call")
-    caller_name: str = Field(..., min_length=1, description="Name of the caller")
-    caller_email: str = Field(..., min_length=1, description="Email of the caller")
-    context: str = Field(..., min_length=1, description="Call context/purpose")
-    system_prompt: str = Field(..., min_length=1, description="The complete system prompt to use")
-    voice: str = Field(default="david", description="Voice name (david, ravi, emily-british, etc.)")
-    language: str = Field(default="en", description="Language code (en or es)")
-    first_name: Optional[str] = Field(default=None, description="Fallback contact first name applied to all numbers")
-    first_names: Optional[List[Optional[str]]] = Field(default=None, description="Per-number first names aligned with phone_numbers")
-    email: Optional[str] = Field(default=None, description="Target contact email for calendar invites/SMS")
-    category: Optional[str] = Field(default=None, description="Call category (e.g., 'appt_setting', 'lead_gen')")
-    
-    @validator('phone_numbers')
+
+    phone_numbers: List[str] = Field(..., min_length=1, description="E.164 or digit strings to dial")
+    caller_name: Optional[str] = Field(default=None, description="Maps to {{caller_name}} in the conversation flow")
+    context: Optional[str] = Field(default=None, description="Mission / script context → {{call_context}}")
+    first_name: Optional[str] = Field(default=None, description="Default first name for all rows if first_names omitted")
+    first_names: Optional[List[Optional[str]]] = Field(
+        default=None, description="Per-number first names; length must match phone_numbers if set"
+    )
+    email: Optional[str] = Field(default=None, description="Contact email for tools / DB row")
+    category: Optional[str] = Field(default=None, description="Optional campaign or bucket label")
+
+    class Config:
+        extra = "ignore"
+
+    @validator("phone_numbers")
     def validate_phone_numbers(cls, v):
         if not v:
             raise ValueError("At least one phone number is required")
-        
-        # Clean and validate each number
         cleaned = []
         for num in v:
-            # Remove spaces, dashes, etc.
-            clean = ''.join(c for c in num if c.isdigit() or c == '+')
+            clean = "".join(c for c in num if c.isdigit() or c == "+")
             if len(clean) < 10:
                 raise ValueError(f"Invalid phone number: {num}")
             cleaned.append(clean)
-        
         return cleaned
 
-    @validator('first_names')
+    @validator("first_names")
     def validate_first_names(cls, v, values, **kwargs):
         if v is None:
             return v
-        phone_numbers = values.get('phone_numbers') or []
-        if phone_numbers and len(v) not in (0, len(phone_numbers)):
-            raise ValueError("first_names must match phone_numbers length or be omitted")
-        # Normalize blanks to None
-        return [name.strip() if name and name.strip() else None for name in v]
+        phone_numbers = values.get("phone_numbers") or []
+        if phone_numbers and len(v) != len(phone_numbers):
+            raise ValueError("first_names must be the same length as phone_numbers or be omitted")
+        return [name.strip() if name and str(name).strip() else None for name in v]
 
-    @validator('category')
+    @validator("category")
     def normalize_category(cls, v):
         if not v:
             return None
-        v_clean = v.strip().lower()
-        allowed = {"appt setting", "appt_setting", "appointment", "lead gen", "lead_gen", "leadgen"}
-        if v_clean not in allowed:
-            return v_clean  # keep flexible but normalized to lower
-        return v_clean
+        return v.strip().lower()
 
 
 class SingleCallPayload(BaseModel):

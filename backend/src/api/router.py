@@ -479,33 +479,45 @@ async def assistant_bulk_call_retell(
                 raise ValueError("empty phone number")
 
             try:
-                cst = db.get_contact_call_status_by_phone(user["id"], phone)
-                if cst == "do_not_call":
+                if db.is_do_not_call_number(user["id"], phone):
                     skipped_do_not_call.append(
-                        {"to_number": phone, "reason": "contact_marked_do_not_call"}
+                        {
+                            "to_number": phone,
+                            "reason": "do_not_call_list_or_contact",
+                        }
                     )
                     continue
             except Exception as e:
                 logging.warning("DNC lookup failed for %s: %s", phone, e)
 
             contact_first_name = None
-            if getattr(payload, "first_names", None) and len(payload.first_names) == len(payload.phone_numbers):
+            if payload.first_names and len(payload.first_names) == len(payload.phone_numbers):
                 contact_first_name = payload.first_names[idx]
             else:
-                contact_first_name = getattr(payload, "first_name", None)
+                contact_first_name = payload.first_name
 
             meta = {
                 "user_id": str(user["id"]),
-                "category": str(getattr(payload, "category", "") or ""),
+                "category": str(payload.category or ""),
                 "contact_first_name": str(contact_first_name or ""),
-                "contact_email": str(getattr(payload, "email", "") or ""),
+                "contact_email": str(payload.email or ""),
             }
             dyn = {
                 "user_id": str(user["id"]),
                 "contact_first_name": str(contact_first_name or ""),
-                "contact_email": str(getattr(payload, "email", "") or ""),
-                "category": str(getattr(payload, "category", "") or ""),
+                "contact_email": str(payload.email or ""),
+                "category": str(payload.category or ""),
             }
+            if payload.caller_name:
+                cn = str(payload.caller_name).strip()
+                if cn:
+                    meta["caller_name"] = cn
+                    dyn["caller_name"] = cn
+            if payload.context:
+                ctx = str(payload.context).strip()
+                if ctx:
+                    meta["call_context"] = ctx
+                    dyn["call_context"] = ctx
 
             resp = retell_create_phone_call(
                 from_number=from_number,
@@ -527,8 +539,8 @@ async def assistant_bulk_call_retell(
                 voice_name=None,
                 to_number=phone,
                 contact_first_name=contact_first_name,
-                contact_email=getattr(payload, "email", None),
-                category=getattr(payload, "category", None),
+                contact_email=payload.email,
+                category=payload.category,
                 call_outcome_status=None,
             )
             try:
@@ -939,35 +951,101 @@ async def get_appointments(user_id: int, from_date: str = None):
         )
 
 
-# @router.post("/agent/check-availability")
-# async def check_availability(request: Request):
-#     """
-#     API for LiveKit agent to check if a time slot is available
-#     """
-#     try:
-#         data = await request.json()
-        
-#         user_id = data.get("user_id")
-#         appointment_date = data.get("appointment_date")
-#         start_time = data.get("start_time")
-#         end_time = data.get("end_time")
-        
-#         has_conflict = db.check_appointment_conflict(
-#             user_id=user_id,
-#             appointment_date=appointment_date,
-#             start_time=start_time,
-#             end_time=end_time
-#         )
-        
-#         return JSONResponse({
-#             "success": True,
-#             "available": not has_conflict,
-#             "message": "Time slot available" if not has_conflict else "Time slot already booked"
-#         })
-        
-#     except Exception as e:
-#         logging.error(f"Error checking availability: {e}")
-#         return error_response(f"Failed to check availability: {str(e)}", status_code=500)
+def _default_end_time_from_start(start_time: str) -> str:
+    """One hour after HH:MM for availability checks."""
+    try:
+        parts = (start_time or "").strip().split(":")
+        h, m = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+        h = (h + 1) % 24
+        return f"{h:02d}:{m:02d}"
+    except Exception:
+        return "15:00"
+
+
+@router.post("/agent/check-availability")
+async def check_availability(request: Request):
+    """
+    Retell tool: verify the client's calendar has no conflicting local appointment.
+    """
+    try:
+        data = await request.json()
+        user_id = data.get("user_id")
+        appointment_date = data.get("appointment_date")
+        start_time = data.get("start_time")
+        end_time = data.get("end_time")
+        if not all([user_id is not None, appointment_date, start_time]):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "available": False,
+                    "message": "user_id, appointment_date, and start_time are required",
+                },
+            )
+        if not end_time:
+            end_time = _default_end_time_from_start(str(start_time))
+        has_conflict = db.check_appointment_conflict(
+            user_id=int(user_id),
+            appointment_date=str(appointment_date),
+            start_time=str(start_time),
+            end_time=str(end_time),
+        )
+        avail = not has_conflict
+        return JSONResponse(
+            {
+                "success": True,
+                "available": avail,
+                "message": "Time slot available" if avail else "Time slot already booked",
+                "conflict_details": None if avail else "Overlaps an existing scheduled appointment",
+                "warning": None,
+            }
+        )
+    except Exception as e:
+        logging.error(f"check_availability: {e}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "available": False, "message": str(e)},
+        )
+
+
+@router.get("/agent/available-slots/{user_id}/{appointment_date}")
+async def agent_available_slots(user_id: int, appointment_date: str):
+    """
+    Retell tool: booked slots for one day (get_available_times). Use YYYY-MM-DD for appointment_date.
+    """
+    try:
+        info = db.get_available_slots(user_id, appointment_date)
+        booked = info.get("booked_slots") or []
+
+        def _fmt(t):
+            if hasattr(t, "isoformat"):
+                return str(t)
+            return str(t) if t is not None else ""
+
+        normalized = []
+        for slot in booked:
+            if isinstance(slot, dict):
+                normalized.append(
+                    {"start": _fmt(slot.get("start")), "end": _fmt(slot.get("end"))}
+                )
+            else:
+                normalized.append(slot)
+        return JSONResponse(
+            {
+                "success": True,
+                "date": info.get("date"),
+                "booked_slots": normalized,
+                "message": "ok",
+            }
+        )
+    except Exception as e:
+        logging.error(f"agent_available_slots: {e}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": str(e), "booked_slots": []},
+        )
 
 
 @router.post("/agent/book-appointment")
@@ -1370,6 +1448,129 @@ async def agent_send_promo_video_sms(request: Request):
         logging.error(f"agent_send_promo_video_sms: {e}")
         traceback.print_exc()
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+@router.post("/agent/update-call-outcome")
+async def update_call_outcome(request: Request):
+    """
+    Retell tool: booked / call_again / do_not_call. Persists outcome and blacklists on do_not_call.
+    """
+    try:
+        data = await request.json()
+        call_id = (data.get("call_id") or "").strip()
+        outcome = (data.get("status") or "").strip().lower()
+
+        allowed = {"booked", "call_again", "do_not_call"}
+        if not call_id or outcome not in allowed:
+            return JSONResponse(
+                {"success": False, "message": "Invalid call_id or status"},
+                status_code=400,
+            )
+
+        with db.conn() as (conn, cursor):
+            cursor.execute(
+                """
+                SELECT user_id, to_number
+                FROM call_history
+                WHERE call_id = %s
+                """,
+                (call_id,),
+            )
+            row = cursor.fetchone()
+
+        if not row:
+            return JSONResponse({"success": False, "message": "Call not found"}, status_code=404)
+
+        user_id = row.get("user_id") if isinstance(row, dict) else row[0]
+        to_number = row.get("to_number") if isinstance(row, dict) else row[1]
+
+        db.update_call_history(call_id, {"call_outcome_status": outcome})
+
+        if user_id and to_number:
+            try:
+                db.update_contact_status(user_id, to_number, outcome)
+            except Exception:
+                logging.warning("update_contact_status failed; continuing")
+            if outcome == "do_not_call":
+                try:
+                    db.add_do_not_call_number(int(user_id), str(to_number), source="submit_call_outcome")
+                except Exception as e:
+                    logging.warning("add_do_not_call_number failed: %s", e)
+
+        try:
+            add_call_event(call_id, "call_outcome", {"status": outcome})
+        except Exception:
+            pass
+
+        return JSONResponse(
+            {"success": True, "status": outcome, "message": "Recorded"}
+        )
+
+    except Exception as e:
+        logging.error(f"update_call_outcome: {e}")
+        traceback.print_exc()
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@router.post("/agent/report-event")
+async def agent_report_event(request: Request):
+    """
+    Retell tool: lightweight logging (call progress, voicemail, etc.). Returns acknowledged=true.
+    """
+    try:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        call_id = (data.get("call_id") or "").strip()
+        status = (data.get("status") or "").strip()
+        user_id = data.get("user_id")
+        notes = data.get("notes")
+        appointment_id = data.get("appointment_id")
+        left_message = data.get("left_message")
+
+        if not call_id:
+            return JSONResponse(
+                {"success": False, "acknowledged": False, "message": "call_id required"},
+                status_code=400,
+            )
+
+        payload = {
+            "status": status,
+            "user_id": user_id,
+            "notes": notes,
+            "appointment_id": appointment_id,
+            "left_message": left_message,
+        }
+        try:
+            add_call_event(call_id, "agent_report_event", payload)
+        except Exception:
+            pass
+
+        # Optional: reflect voicemail on call row
+        if status == "voicemail" or status == "unanswered":
+            try:
+                db.update_call_history(
+                    call_id,
+                    {"status": status if status in ("voicemail", "unanswered") else "connected"},
+                )
+            except Exception:
+                pass
+
+        return JSONResponse(
+            {
+                "success": True,
+                "acknowledged": True,
+                "message": "ok",
+            }
+        )
+    except Exception as e:
+        logging.error(f"agent_report_event: {e}")
+        traceback.print_exc()
+        return JSONResponse(
+            {"success": False, "acknowledged": False, "message": str(e)},
+            status_code=500,
+        )
 
 
 @router.get("/google/auth/status")

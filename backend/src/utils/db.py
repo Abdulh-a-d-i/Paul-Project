@@ -70,6 +70,7 @@ class PGDB:
         self.create_appointments_table()
         self.create_user_prompts_table()
         self.create_contacts_table()
+        self.create_do_not_call_numbers_table()
         self.create_voices_table()
         self.create_google_credentials_table()
 
@@ -1082,19 +1083,97 @@ class PGDB:
                 logging.error(f"Error getting appointments: {e}")
                 raise
 
-    def get_contact_call_status_by_phone(self, user_id: int, phone: str) -> Optional[str]:
-        """
-        Return contacts.call_status for this user/phone, or None if no matching contact.
-        Phone may be E.164 or raw digits; matches stored phone_number flexibly.
-        """
+    def _phone_digit_variants(self, phone: str) -> list[str]:
+        """Digits-only variants for matching stored numbers (E.164 vs 10-digit)."""
         d = "".join(c for c in (phone or "") if c.isdigit())
         if not d:
-            return None
+            return []
         variants = {d}
         if len(d) == 11 and d.startswith("1"):
             variants.add(d[1:])
         if len(d) >= 10:
             variants.add(d[-10:])
+        return list(variants)
+
+    def create_do_not_call_numbers_table(self):
+        """Persistent DNC list per user (survives without a contacts row)."""
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS do_not_call_numbers (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        phone_digits VARCHAR(32) NOT NULL,
+                        source TEXT,
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(user_id, phone_digits)
+                    );
+                    """
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_dnc_user_phone ON do_not_call_numbers(user_id, phone_digits);"
+                )
+                conn.commit()
+                logging.info("✅ do_not_call_numbers table ready")
+            except Exception as e:
+                logging.error(f"Error creating do_not_call_numbers: {e}")
+
+    def add_do_not_call_number(self, user_id: int, phone: str, source: str = "agent") -> None:
+        """Block a dialed number for this user (idempotent)."""
+        variants = self._phone_digit_variants(phone)
+        if not variants:
+            return
+        ten = [v for v in variants if len(v) == 10]
+        store = ten[0] if ten else max(variants, key=len)
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO do_not_call_numbers (user_id, phone_digits, source)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id, phone_digits) DO NOTHING
+                    """,
+                    (user_id, store, source[:255] if source else None),
+                )
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"add_do_not_call_number: {e}")
+                raise
+
+    def is_do_not_call_number(self, user_id: int, phone: str) -> bool:
+        """
+        True if this number must not be dialed: explicit DNC table or contacts.call_status.
+        """
+        if self.get_contact_call_status_by_phone(user_id, phone) == "do_not_call":
+            return True
+        variants = self._phone_digit_variants(phone)
+        if not variants:
+            return False
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute(
+                    """
+                    SELECT 1 FROM do_not_call_numbers
+                    WHERE user_id = %s AND phone_digits = ANY(%s)
+                    LIMIT 1
+                    """,
+                    (user_id, variants),
+                )
+                return cursor.fetchone() is not None
+            except Exception as e:
+                logging.error(f"is_do_not_call_number: {e}")
+                raise
+
+    def get_contact_call_status_by_phone(self, user_id: int, phone: str) -> Optional[str]:
+        """
+        Return contacts.call_status for this user/phone, or None if no matching contact.
+        Phone may be E.164 or raw digits; matches stored phone_number flexibly.
+        """
+        variants = self._phone_digit_variants(phone)
+        if not variants:
+            return None
         with self.conn(dict_cursor=False) as (conn, cursor):
             try:
                 cursor.execute(
@@ -1103,7 +1182,7 @@ class PGDB:
                     WHERE user_id = %s AND phone_number = ANY(%s)
                     LIMIT 1
                     """,
-                    (user_id, list(variants)),
+                    (user_id, variants),
                 )
                 row = cursor.fetchone()
                 return row[0] if row else None
@@ -1432,7 +1511,10 @@ class PGDB:
                 raise
 
     def update_contact_status(self, user_id: int, phone_number: str, status: str):
-        """Update contact call_status by phone number for a user (idempotent)."""
+        """Update contact call_status by phone number for a user (idempotent). Matches E.164 or 10-digit."""
+        variants = self._phone_digit_variants(phone_number)
+        if not variants:
+            return
         with self.conn(dict_cursor=False) as (conn, cursor):
             try:
                 cursor.execute(
@@ -1440,9 +1522,9 @@ class PGDB:
                     UPDATE contacts
                     SET call_status = %s,
                         updated_at = CURRENT_TIMESTAMP
-                    WHERE user_id = %s AND phone_number = %s
+                    WHERE user_id = %s AND phone_number = ANY(%s)
                     """,
-                    (status, user_id, phone_number)
+                    (status, user_id, variants)
                 )
                 conn.commit()
             except Exception as e:
