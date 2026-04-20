@@ -5,6 +5,9 @@ import os
 import traceback
 from datetime import datetime, timezone
 import asyncio
+import csv
+import io
+from typing import Any, Optional
 from dotenv import load_dotenv
 from fastapi import (
     APIRouter,
@@ -12,6 +15,8 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    UploadFile,
+    File,
 )
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
@@ -53,6 +58,7 @@ from src.utils.retell_utils import (
     retell_get_conversation_flow,
     retell_update_conversation_flow,
     retell_create_phone_call,
+    retell_resolve_outbound_from_number,
 )
 
 # Google OAuth Configuration
@@ -77,6 +83,9 @@ AWS_BUCKET_NAME = os.getenv("AWS_S3_BUCKET_NAME")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+# In-process campaign run tasks (best-effort). Persisted progress is stored in DB.
+_CAMPAIGN_RUN_TASKS: dict[int, asyncio.Task] = {}
 
 # error response 
 def error_response(message, status_code=400):
@@ -177,10 +186,16 @@ async def retell_webhook(request: Request):
 
     # Best-effort: try to resolve user_id from metadata/dynamic vars if present.
     user_id = None
+    campaign_id: Optional[int] = None
+    campaign_run_id: Optional[int] = None
     try:
         meta = call.get("metadata") or {}
         if isinstance(meta, dict) and meta.get("user_id") is not None:
             user_id = int(meta.get("user_id"))
+        if isinstance(meta, dict) and meta.get("campaign_id") is not None:
+            campaign_id = int(meta.get("campaign_id"))
+        if isinstance(meta, dict) and meta.get("campaign_run_id") is not None:
+            campaign_run_id = int(meta.get("campaign_run_id"))
     except Exception:
         user_id = None
     try:
@@ -217,6 +232,8 @@ async def retell_webhook(request: Request):
                 contact_email=None,
                 category=None,
                 call_outcome_status=None,
+                campaign_id=campaign_id,
+                campaign_run_id=campaign_run_id,
             )
         except Exception:
             pass
@@ -229,6 +246,8 @@ async def retell_webhook(request: Request):
         "ended_at": ended_at,
         "duration": duration,
         "recording_url": recording_url,
+        "campaign_id": campaign_id,
+        "campaign_run_id": campaign_run_id,
     }
     if transcript:
         updates["transcript"] = transcript
@@ -244,6 +263,300 @@ async def retell_webhook(request: Request):
     except Exception:
         pass
     return Response(status_code=204)
+
+
+def _parse_contacts_csv_bytes(raw: bytes) -> tuple[list[dict[str, Any]], list[str]]:
+    """
+    Parse a CSV of contacts/numbers.
+    Accepts headers like: phone_number / phone / Phone Number, first_name, last_name, email.
+    Returns (contacts_for_db, phone_numbers_in_order).
+    """
+    text = raw.decode("utf-8-sig", errors="replace")
+    f = io.StringIO(text)
+    reader = csv.DictReader(f)
+    contacts: list[dict[str, Any]] = []
+    phones: list[str] = []
+    for row in reader:
+        if not isinstance(row, dict):
+            continue
+        # header normalization
+        def _get(*keys: str) -> str:
+            for k in keys:
+                if k in row and row[k] is not None:
+                    return str(row[k]).strip()
+            # case-insensitive fallback
+            lower = {str(k).strip().lower(): v for k, v in row.items()}
+            for k in keys:
+                lk = k.lower()
+                if lk in lower and lower[lk] is not None:
+                    return str(lower[lk]).strip()
+            return ""
+
+        phone = _get("phone_number", "phone", "Phone Number", "Phone", "number", "Number")
+        if not phone:
+            continue
+        first = _get("first_name", "first", "First Name")
+        last = _get("last_name", "last", "Last Name")
+        email = _get("email", "Email")
+        contacts.append({"phone_number": phone, "first_name": first, "last_name": last, "email": email})
+        phones.append(phone)
+    return contacts, phones
+
+
+@router.post("/campaigns")
+async def create_campaign(request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    name = str((body or {}).get("name") or "").strip()
+    description = (body or {}).get("description")
+    description = str(description).strip() if description is not None else None
+    if not name:
+        return error_response("name is required", status_code=400)
+    try:
+        row = db.create_campaign(user["id"], name=name, description=description)
+        return JSONResponse(content=jsonable_encoder({"success": True, "campaign": row}))
+    except Exception as e:
+        logging.error(f"create_campaign: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/campaigns")
+async def list_campaigns(include_archived: bool = Query(False), user=Depends(get_current_user)):
+    try:
+        rows = db.list_campaigns(user["id"], include_archived=include_archived)
+        return JSONResponse(content=jsonable_encoder({"success": True, "count": len(rows), "campaigns": rows}))
+    except Exception as e:
+        logging.error(f"list_campaigns: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/campaigns/{campaign_id}")
+async def get_campaign(campaign_id: int, user=Depends(get_current_user)):
+    row = db.get_campaign(user["id"], int(campaign_id))
+    if not row:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    total_contacts = db.count_campaign_contacts(user["id"], int(campaign_id))
+    return JSONResponse(content=jsonable_encoder({"success": True, "campaign": row, "total_contacts": total_contacts}))
+
+
+@router.post("/campaigns/{campaign_id}/archive")
+async def archive_campaign(campaign_id: int, request: Request, user=Depends(get_current_user)):
+    body = await request.json()
+    is_archived = bool((body or {}).get("is_archived", True))
+    row = db.set_campaign_archived(user["id"], int(campaign_id), is_archived=is_archived)
+    if not row:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return JSONResponse(content=jsonable_encoder({"success": True, "campaign": row}))
+
+
+@router.post("/campaigns/{campaign_id}/upload")
+async def upload_campaign_numbers(
+    campaign_id: int,
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+):
+    """
+    Upload a CSV and persist numbers to contacts + link to the campaign.
+    """
+    camp = db.get_campaign(user["id"], int(campaign_id))
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    raw = await file.read()
+    contacts, phones = _parse_contacts_csv_bytes(raw)
+    if not phones:
+        return error_response("No phone numbers found in CSV", status_code=400)
+    try:
+        # Persist contacts (idempotent by (user_id, phone_number))
+        db.save_contacts_bulk(user["id"], contacts)
+        # Link contacts to campaign
+        link = db.attach_contacts_to_campaign_by_phones(user["id"], int(campaign_id), phones)
+        total_contacts = db.count_campaign_contacts(user["id"], int(campaign_id))
+        return JSONResponse(
+            content=jsonable_encoder(
+                {
+                    "success": True,
+                    "campaign_id": int(campaign_id),
+                    "uploaded_rows": len(phones),
+                    "linked_contacts": link.get("attached", 0),
+                    "total_contacts": total_contacts,
+                }
+            )
+        )
+    except Exception as e:
+        logging.error(f"upload_campaign_numbers: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _run_campaign_batches(
+    *,
+    user_id: int,
+    campaign_id: int,
+    run_id: int,
+    batch_size: int,
+):
+    """
+    Background runner:
+    - pull campaign phones
+    - initiate calls in batches of N
+    - wait for each batch to finish (best-effort via call_history status updates)
+    """
+    agent_id = (os.getenv("RETELL_AGENT_ID") or "").strip()
+    if not agent_id:
+        db.update_campaign_run(run_id, {"status": "failed", "last_error": "RETELL_AGENT_ID is not configured"})
+        return
+    from_number = retell_resolve_outbound_from_number(agent_id)
+    if not from_number:
+        db.update_campaign_run(run_id, {"status": "failed", "last_error": "RETELL_FROM_NUMBER is not configured"})
+        return
+
+    phones = db.list_campaign_contact_phones(user_id, campaign_id)
+    total_contacts = len(phones)
+    db.update_campaign_run(
+        run_id,
+        {"status": "running", "started_at": datetime.now(timezone.utc), "total_contacts": total_contacts},
+    )
+
+    processed = 0
+    initiated = 0
+    failed = 0
+
+    def _is_terminal_status(s: str | None) -> bool:
+        if not s:
+            return False
+        s = str(s).strip().lower()
+        return s in ("completed", "ended", "failed", "error", "disconnected", "hangup", "call_analyzed")
+
+    try:
+        for i in range(0, total_contacts, batch_size):
+            batch = phones[i : i + batch_size]
+            call_ids: list[str] = []
+            # Initiate this batch
+            for phone in batch:
+                try:
+                    meta = {"user_id": str(user_id), "campaign_id": str(campaign_id), "campaign_run_id": str(run_id)}
+                    dyn = {"user_id": str(user_id)}
+                    resp = retell_create_phone_call(
+                        from_number=from_number,
+                        to_number=str(phone),
+                        override_agent_id=agent_id,
+                        metadata=meta,
+                        dynamic_variables=dyn,
+                    )
+                    call_id = (resp.get("call_id") or "").strip()
+                    if not call_id:
+                        raise RuntimeError("Retell did not return call_id")
+                    call_ids.append(call_id)
+                    initiated += 1
+                    # Ensure row exists immediately (webhook will fill the rest)
+                    try:
+                        db.insert_call_history(
+                            user_id=user_id,
+                            call_id=call_id,
+                            status="initiated",
+                            from_number=from_number,
+                            to_number=str(phone),
+                            voice_name=None,
+                            voice_id=None,
+                            contact_first_name=None,
+                            contact_email=None,
+                            category="campaign",
+                            call_outcome_status=None,
+                            campaign_id=campaign_id,
+                            campaign_run_id=run_id,
+                        )
+                    except Exception:
+                        pass
+                except Exception as e:
+                    failed += 1
+                    logging.warning("Campaign run %s: failed to initiate call to %s: %s", run_id, phone, e)
+
+            processed += len(batch)
+            db.update_campaign_run(
+                run_id,
+                {
+                    "processed_contacts": processed,
+                    "initiated_calls": initiated,
+                    "failed_calls": failed,
+                },
+            )
+
+            # Best-effort: wait for this batch to finish (webhook-driven)
+            if call_ids:
+                deadline = datetime.now(timezone.utc).timestamp() + (60 * 30)  # 30m per batch hard cap
+                while True:
+                    # Fetch statuses
+                    rows = db.execute(
+                        "SELECT call_id, status FROM call_history WHERE call_id = ANY(%s)",
+                        (call_ids,),
+                        fetchall=True,
+                    ) or []
+                    status_by_id = {r.get("call_id"): r.get("status") for r in rows if isinstance(r, dict)}
+                    done = all(_is_terminal_status(status_by_id.get(cid)) for cid in call_ids)
+                    if done:
+                        break
+                    if datetime.now(timezone.utc).timestamp() > deadline:
+                        logging.warning("Campaign run %s: batch wait timed out", run_id)
+                        break
+                    await asyncio.sleep(5)
+
+        db.update_campaign_run(run_id, {"status": "completed", "ended_at": datetime.now(timezone.utc)})
+    except Exception as e:
+        db.update_campaign_run(run_id, {"status": "failed", "ended_at": datetime.now(timezone.utc), "last_error": str(e)})
+        logging.error("Campaign run %s failed: %s", run_id, e)
+        traceback.print_exc()
+
+
+@router.post("/campaigns/{campaign_id}/run")
+async def run_campaign(campaign_id: int, batch_size: int = Query(15, ge=1, le=50), user=Depends(get_current_user)):
+    camp = db.get_campaign(user["id"], int(campaign_id))
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    run = db.create_campaign_run(user["id"], int(campaign_id), batch_size=int(batch_size))
+    run_id = int(run["id"])
+    # Fire-and-forget background task in-process; progress is stored in DB.
+    task = asyncio.create_task(
+        _run_campaign_batches(user_id=user["id"], campaign_id=int(campaign_id), run_id=run_id, batch_size=int(batch_size))
+    )
+    _CAMPAIGN_RUN_TASKS[run_id] = task
+    return JSONResponse(content=jsonable_encoder({"success": True, "run": run}))
+
+
+@router.get("/campaign-runs/{run_id}")
+async def get_campaign_run(run_id: int, user=Depends(get_current_user)):
+    row = db.get_campaign_run(user["id"], int(run_id))
+    if not row:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return JSONResponse(content=jsonable_encoder({"success": True, "run": row}))
+
+
+@router.get("/campaign-runs/{run_id}/stats")
+async def get_campaign_run_stats(run_id: int, user=Depends(get_current_user)):
+    row = db.get_campaign_run(user["id"], int(run_id))
+    if not row:
+        raise HTTPException(status_code=404, detail="Run not found")
+    call_stats = db.get_campaign_run_call_stats(user["id"], int(run_id))
+    return JSONResponse(content=jsonable_encoder({"success": True, "run_id": int(run_id), "call_stats": call_stats}))
+
+
+@router.get("/campaigns/{campaign_id}/stats")
+async def get_campaign_stats(campaign_id: int, user=Depends(get_current_user)):
+    camp = db.get_campaign(user["id"], int(campaign_id))
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    total_contacts = db.count_campaign_contacts(user["id"], int(campaign_id))
+    call_stats = db.get_campaign_call_stats(user["id"], int(campaign_id))
+    return JSONResponse(
+        content=jsonable_encoder(
+            {
+                "success": True,
+                "campaign_id": int(campaign_id),
+                "total_contacts": total_contacts,
+                "call_stats": call_stats,
+            }
+        )
+    )
 
 
 @router.get("/retell/flow/editor")
@@ -449,16 +762,19 @@ async def assistant_bulk_call_retell(
     Creates one Retell call per phone number and stores the returned call_id in DB.
     """
     agent_id = (os.getenv("RETELL_AGENT_ID") or "").strip()
-    from_number = (
-        os.getenv("RETELL_FROM_NUMBER")
-        or os.getenv("RETELL_OUTBOUND_FROM_NUMBER")
-        or os.getenv("RETELL_OUTBOUND_NUMBER")
-        or ""
-    ).strip()
     if not agent_id:
         raise HTTPException(status_code=500, detail="RETELL_AGENT_ID is not configured")
+    from_number = retell_resolve_outbound_from_number(agent_id)
     if not from_number:
-        raise HTTPException(status_code=500, detail="RETELL_FROM_NUMBER is not configured")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Outbound caller ID required for Retell create-phone-call (not inferred from UI alone). "
+                "Set RETELL_FROM_NUMBER=+1... in paul/.env (two L's in RETELL — not RETEL_). "
+                "Also accepted: RETELL_OUTBOUND_FROM_NUMBER, RETELL_PHONE_NUMBER, TWILIO_PHONE_NUMBER. "
+                "Restart uvicorn after saving."
+            ),
+        )
 
     initiated_calls = []
     failed_calls = []
@@ -786,6 +1102,7 @@ async def get_user_call_history(
 
             # Explicitly surface phone number and outcome status for each entry
             call_data["phone_number"] = call.get("to_number")
+            call_data["caller_number"] = call.get("from_number")
             call_data["call_outcome_status"] = call.get("call_outcome_status")
             call_data["contact_call_status"] = call.get("contact_call_status")
             
@@ -856,6 +1173,21 @@ async def get_user_call_history(
 
     except Exception as e:
         logging.error(f"Error fetching history: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/analytics-summary")
+async def get_analytics_summary(user=Depends(get_current_user)):
+    """
+    Analytics summary for the logged-in user's calls.
+    Mirrors the shape used in CallFlow_Backend-main (`/agent/analytics-summary`) but scoped per user.
+    """
+    try:
+        data = db.get_analytics_summary(user["id"])
+        return JSONResponse(content=jsonable_encoder({"success": True, "data": data}))
+    except Exception as e:
+        logging.error(f"Error fetching analytics summary: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -965,7 +1297,10 @@ def _default_end_time_from_start(start_time: str) -> str:
 @router.post("/agent/check-availability")
 async def check_availability(request: Request):
     """
-    Retell tool: verify the client's calendar has no conflicting local appointment.
+    Retell tool: verify availability.
+
+    - If Google Calendar is connected: check Google Calendar for conflicts (primary source of truth).
+    - If not connected (or Google check fails): fall back to local DB `appointments` table.
     """
     try:
         data = await request.json()
@@ -984,20 +1319,58 @@ async def check_availability(request: Request):
             )
         if not end_time:
             end_time = _default_end_time_from_start(str(start_time))
-        has_conflict = db.check_appointment_conflict(
-            user_id=int(user_id),
-            appointment_date=str(appointment_date),
-            start_time=str(start_time),
-            end_time=str(end_time),
-        )
-        avail = not has_conflict
+        uid = int(user_id)
+        appt_date = str(appointment_date)
+        st = str(start_time)
+        et = str(end_time)
+
+        warning = None
+        source = "local_db"
+        avail: bool
+
+        credentials = None
+        try:
+            credentials = db.get_google_credentials(uid)
+        except Exception:
+            credentials = None
+
+        if credentials:
+            try:
+                gcal = GoogleCalendarService(credentials)
+                date_obj = datetime.fromisoformat(appt_date)
+                start_hour, start_min = map(int, st.split(":"))
+                end_hour, end_min = map(int, et.split(":"))
+                start_datetime = date_obj.replace(hour=start_hour, minute=start_min, tzinfo=timezone.utc)
+                end_datetime = date_obj.replace(hour=end_hour, minute=end_min, tzinfo=timezone.utc)
+
+                source = "google_calendar"
+                avail = bool(gcal.check_availability(start_datetime, end_datetime))
+            except Exception as e:
+                warning = f"Google Calendar availability check failed; fell back to local DB. Error: {e}"
+                has_conflict = db.check_appointment_conflict(
+                    user_id=uid,
+                    appointment_date=appt_date,
+                    start_time=st,
+                    end_time=et,
+                )
+                source = "local_db"
+                avail = not has_conflict
+        else:
+            has_conflict = db.check_appointment_conflict(
+                user_id=uid,
+                appointment_date=appt_date,
+                start_time=st,
+                end_time=et,
+            )
+            avail = not has_conflict
         return JSONResponse(
             {
                 "success": True,
                 "available": avail,
                 "message": "Time slot available" if avail else "Time slot already booked",
                 "conflict_details": None if avail else "Overlaps an existing scheduled appointment",
-                "warning": None,
+                "warning": warning,
+                "source": source,
             }
         )
     except Exception as e:
@@ -1067,26 +1440,45 @@ async def book_appointment(request: Request):
         
         logging.info(f"Booking appointment for user {user_id}: {appointment_date} {start_time}-{end_time}")
         
-        if not all([user_id, appointment_date, start_time, end_time]):
+        if not all([user_id, appointment_date, start_time]):
             return JSONResponse(
                 status_code=400,
                 content={"success": False, "message": "Missing required fields"}
+            )
+        if not end_time:
+            end_time = _default_end_time_from_start(str(start_time))
+
+        uid = int(user_id)
+        appt_date = str(appointment_date)
+        st = str(start_time)
+        et = str(end_time)
+
+        # Always prevent double-booking locally (even if Google Calendar is connected).
+        if db.check_appointment_conflict(uid, appt_date, st, et):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "message": "Time slot already booked",
+                    "available": False,
+                    "source": "local_db",
+                },
             )
         
         google_event_id = None
         google_success = False
         
         try:
-            credentials = db.get_google_credentials(user_id)
+            credentials = db.get_google_credentials(uid)
             
             if credentials:
                 logging.info("User has Google Calendar connected")
                 
                 gcal = GoogleCalendarService(credentials)
                 
-                date_obj = datetime.fromisoformat(appointment_date)
-                start_hour, start_min = map(int, start_time.split(':'))
-                end_hour, end_min = map(int, end_time.split(':'))
+                date_obj = datetime.fromisoformat(appt_date)
+                start_hour, start_min = map(int, st.split(':'))
+                end_hour, end_min = map(int, et.split(':'))
                 
                 start_datetime = date_obj.replace(hour=start_hour, minute=start_min, tzinfo=timezone.utc)
                 end_datetime = date_obj.replace(hour=end_hour, minute=end_min, tzinfo=timezone.utc)
@@ -1096,6 +1488,18 @@ async def book_appointment(request: Request):
                 full_description = description
                 if notes:
                     full_description += f"\n\nNotes: {notes}"
+
+                # If Google is connected, don't create the event if it conflicts there.
+                if not gcal.check_availability(start_datetime, end_datetime):
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "success": False,
+                            "message": "Time slot conflicts with Google Calendar",
+                            "available": False,
+                            "source": "google_calendar",
+                        },
+                    )
                 
                 event = gcal.create_event(
                     summary=title,
@@ -1113,7 +1517,7 @@ async def book_appointment(request: Request):
                 
                 updated_creds = gcal.get_updated_credentials()
                 if updated_creds['access_token'] != credentials['access_token']:
-                    db.save_google_credentials(user_id, **updated_creds)
+                    db.save_google_credentials(uid, **updated_creds)
             else:
                 logging.warning("User does not have Google Calendar connected")
         
@@ -1123,14 +1527,15 @@ async def book_appointment(request: Request):
         
         try:
             appointment_id = db.create_appointment(
-                user_id=user_id,
-                appointment_date=appointment_date,
-                start_time=start_time,
-                end_time=end_time,
+                user_id=uid,
+                appointment_date=appt_date,
+                start_time=st,
+                end_time=et,
                 attendee_name=attendee_name,
                 attendee_email=organizer_email or "",
                 title=title,
-                description=description + (f"\n\nNotes: {notes}" if notes else "")
+                description=description + (f"\n\nNotes: {notes}" if notes else ""),
+                notes=notes or "",
             )
             
             logging.info(f"Appointment saved to database: ID {appointment_id}")
@@ -1139,8 +1544,8 @@ async def book_appointment(request: Request):
                 try:
                     sms_sent = send_appointment_confirmation_sms(
                         phone_number=phone_number,
-                        appointment_date=appointment_date,
-                        start_time=start_time,
+                        appointment_date=appt_date,
+                        start_time=st,
                         title=title,
                         attendee_name=attendee_name
                     )

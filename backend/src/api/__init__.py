@@ -1,3 +1,13 @@
+# Load paul/.env before router (so cwd does not matter when using uvicorn from another directory)
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+_PAUL_ROOT = Path(__file__).resolve().parent.parent.parent
+_ENV_FILE = _PAUL_ROOT / ".env"
+if _ENV_FILE.is_file():
+    load_dotenv(_ENV_FILE, override=True)
+
 from .router import router
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse

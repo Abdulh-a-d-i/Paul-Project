@@ -146,6 +146,68 @@ def retell_list_voices() -> list[dict[str, Any]]:
     return [v for v in data if isinstance(v, dict)]
 
 
+def retell_outbound_from_number() -> str:
+    """
+    Caller ID for outbound calls (E.164). Tries several env names, including
+    RETEL_FROM_NUMBER (one L), a common typo for RETELL_FROM_NUMBER.
+    """
+    for key in (
+        "RETELL_FROM_NUMBER",
+        "RETEL_FROM_NUMBER",  # typo: one L
+        "RETELL_OUTBOUND_FROM_NUMBER",
+        "RETELL_OUTBOUND_NUMBER",
+        "RETELL_PHONE_NUMBER",
+        "TWILIO_PHONE_NUMBER",
+    ):
+        v = (os.getenv(key) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _from_number_from_agent_dict(agent: dict[str, Any]) -> str:
+    """Best-effort: some agent payloads include a linked phone; field names vary."""
+    if not isinstance(agent, dict):
+        return ""
+    for key in (
+        "phone_number",
+        "from_number",
+        "outbound_phone_number",
+        "bound_phone_number",
+        "telephony_phone_number",
+    ):
+        v = agent.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    nested = agent.get("agent")
+    if isinstance(nested, dict):
+        s = _from_number_from_agent_dict(nested)
+        if s:
+            return s
+    return ""
+
+
+def retell_resolve_outbound_from_number(agent_id: str) -> str:
+    """
+    E.164 caller ID for create-phone-call.
+
+    Retell's API requires ``from_number`` on every outbound request; the dashboard
+    does not inject it for you. Order: env vars, then get-agent payload (if present).
+    """
+    fn = retell_outbound_from_number()
+    if fn:
+        return fn
+    aid = (agent_id or "").strip()
+    if not aid:
+        return ""
+    try:
+        agent = retell_get_agent(aid)
+        return _from_number_from_agent_dict(agent)
+    except Exception as e:
+        logger.warning("retell_resolve_outbound_from_number: get-agent failed: %s", e)
+        return ""
+
+
 def retell_create_phone_call(
     *,
     from_number: str,
@@ -164,7 +226,9 @@ def retell_create_phone_call(
     fn = (from_number or "").strip()
     tn = (to_number or "").strip()
     if not fn:
-        raise RuntimeError("from_number is required (configure RETELL_FROM_NUMBER)")
+        raise RuntimeError(
+            "from_number is required (set RETELL_FROM_NUMBER or use retell_resolve_outbound_from_number)"
+        )
     if not tn:
         raise RuntimeError("to_number is required")
 

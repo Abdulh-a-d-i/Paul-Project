@@ -113,7 +113,8 @@ class BulkCallPayload(BaseModel):
     context: Optional[str] = Field(default=None, description="Mission / script context → {{call_context}}")
     first_name: Optional[str] = Field(default=None, description="Default first name for all rows if first_names omitted")
     first_names: Optional[List[Optional[str]]] = Field(
-        default=None, description="Per-number first names; length must match phone_numbers if set"
+        default=None,
+        description="Per-number first names; if longer than phone_numbers, extra entries are dropped; if shorter, padded with nulls",
     )
     email: Optional[str] = Field(default=None, description="Contact email for tools / DB row")
     category: Optional[str] = Field(default=None, description="Optional campaign or bucket label")
@@ -138,9 +139,17 @@ class BulkCallPayload(BaseModel):
         if v is None:
             return v
         phone_numbers = values.get("phone_numbers") or []
-        if phone_numbers and len(v) != len(phone_numbers):
-            raise ValueError("first_names must be the same length as phone_numbers or be omitted")
-        return [name.strip() if name and str(name).strip() else None for name in v]
+        if not phone_numbers:
+            return v
+        normalized = [
+            name.strip() if name is not None and str(name).strip() else None for name in v
+        ]
+        n = len(phone_numbers)
+        if len(normalized) > n:
+            normalized = normalized[:n]
+        elif len(normalized) < n:
+            normalized = normalized + [None] * (n - len(normalized))
+        return normalized
 
     @validator("category")
     def normalize_category(cls, v):

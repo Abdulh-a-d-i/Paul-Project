@@ -70,6 +70,7 @@ class PGDB:
         self.create_appointments_table()
         self.create_user_prompts_table()
         self.create_contacts_table()
+        self.create_campaigns_tables()
         self.create_do_not_call_numbers_table()
         self.create_voices_table()
         self.create_google_credentials_table()
@@ -595,6 +596,8 @@ class PGDB:
                         voice_name TEXT,
                         from_number TEXT NULL,
                         to_number TEXT NULL,
+                        campaign_id INTEGER NULL,
+                        campaign_run_id INTEGER NULL,
                         transcript_url TEXT, -- ADDED
                         transcript_blob TEXT, -- ADDED
                         recording_blob TEXT, -- ADDED
@@ -605,14 +608,340 @@ class PGDB:
                 # Add indexes if missing (idempotent)
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_call_history_events_log ON call_history USING GIN (events_log);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_call_history_agent_events ON call_history USING GIN (agent_events);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_call_history_campaign_id ON call_history(campaign_id);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_call_history_campaign_run_id ON call_history(campaign_run_id);")
                 # Idempotent column backfills (in case table already existed)
                 cursor.execute("ALTER TABLE call_history ADD COLUMN IF NOT EXISTS call_outcome_status TEXT;")
                 cursor.execute("ALTER TABLE call_history ADD COLUMN IF NOT EXISTS contact_first_name TEXT;")
                 cursor.execute("ALTER TABLE call_history ADD COLUMN IF NOT EXISTS contact_email TEXT;")
                 cursor.execute("ALTER TABLE call_history ADD COLUMN IF NOT EXISTS category TEXT;")
+                cursor.execute("ALTER TABLE call_history ADD COLUMN IF NOT EXISTS campaign_id INTEGER;")
+                cursor.execute("ALTER TABLE call_history ADD COLUMN IF NOT EXISTS campaign_run_id INTEGER;")
                 conn.commit()
             except Exception as e:
                 logging.error(f"Error creating call_history table: {e}")
+
+    def create_campaigns_tables(self):
+        """
+        Campaigns: a named set of contacts (numbers) you can re-use and run repeatedly.
+        """
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS campaigns (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        name TEXT NOT NULL,
+                        description TEXT,
+                        is_archived BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(user_id, name)
+                    );
+                    """
+                )
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_campaigns_user_id ON campaigns(user_id);")
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS campaign_contacts (
+                        id SERIAL PRIMARY KEY,
+                        campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+                        contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(campaign_id, contact_id)
+                    );
+                    """
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_campaign_contacts_campaign_id ON campaign_contacts(campaign_id);"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_campaign_contacts_contact_id ON campaign_contacts(contact_id);"
+                )
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS campaign_runs (
+                        id SERIAL PRIMARY KEY,
+                        campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        status TEXT NOT NULL DEFAULT 'queued',
+                        batch_size INTEGER NOT NULL DEFAULT 15,
+                        total_contacts INTEGER NOT NULL DEFAULT 0,
+                        processed_contacts INTEGER NOT NULL DEFAULT 0,
+                        initiated_calls INTEGER NOT NULL DEFAULT 0,
+                        failed_calls INTEGER NOT NULL DEFAULT 0,
+                        started_at TIMESTAMPTZ,
+                        ended_at TIMESTAMPTZ,
+                        last_error TEXT,
+                        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                    );
+                    """
+                )
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_campaign_runs_campaign_id ON campaign_runs(campaign_id);")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_campaign_runs_user_id ON campaign_runs(user_id);")
+
+                # Best-effort foreign keys on call_history for campaign linkage (safe if already exists)
+                try:
+                    cursor.execute(
+                        """
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1
+                                FROM pg_constraint
+                                WHERE conname = 'fk_call_history_campaign_id'
+                            ) THEN
+                                ALTER TABLE call_history
+                                ADD CONSTRAINT fk_call_history_campaign_id
+                                FOREIGN KEY (campaign_id) REFERENCES campaigns(id) ON DELETE SET NULL;
+                            END IF;
+                        END $$;
+                        """
+                    )
+                except Exception:
+                    pass
+                try:
+                    cursor.execute(
+                        """
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1
+                                FROM pg_constraint
+                                WHERE conname = 'fk_call_history_campaign_run_id'
+                            ) THEN
+                                ALTER TABLE call_history
+                                ADD CONSTRAINT fk_call_history_campaign_run_id
+                                FOREIGN KEY (campaign_run_id) REFERENCES campaign_runs(id) ON DELETE SET NULL;
+                            END IF;
+                        END $$;
+                        """
+                    )
+                except Exception:
+                    pass
+
+                conn.commit()
+                logging.info("✅ campaigns tables created/updated")
+            except Exception as e:
+                conn.rollback()
+                logging.error(f"Error creating campaigns tables: {e}")
+                raise
+
+    # ---------------- Campaign CRUD / linking ----------------
+    def create_campaign(self, user_id: int, name: str, description: str | None = None) -> dict:
+        with self.conn() as (conn, cursor):
+            cursor.execute(
+                """
+                INSERT INTO campaigns (user_id, name, description)
+                VALUES (%s, %s, %s)
+                RETURNING id, user_id, name, description, is_archived, created_at, updated_at;
+                """,
+                (user_id, name, description),
+            )
+            conn.commit()
+            return cursor.fetchone()
+
+    def list_campaigns(self, user_id: int, include_archived: bool = False) -> list[dict]:
+        with self.conn() as (conn, cursor):
+            if include_archived:
+                cursor.execute(
+                    """
+                    SELECT id, user_id, name, description, is_archived, created_at, updated_at
+                    FROM campaigns
+                    WHERE user_id=%s
+                    ORDER BY created_at DESC
+                    """,
+                    (user_id,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, user_id, name, description, is_archived, created_at, updated_at
+                    FROM campaigns
+                    WHERE user_id=%s AND is_archived=false
+                    ORDER BY created_at DESC
+                    """,
+                    (user_id,),
+                )
+            return cursor.fetchall()
+
+    def get_campaign(self, user_id: int, campaign_id: int) -> dict | None:
+        with self.conn() as (conn, cursor):
+            cursor.execute(
+                """
+                SELECT id, user_id, name, description, is_archived, created_at, updated_at
+                FROM campaigns
+                WHERE user_id=%s AND id=%s
+                """,
+                (user_id, campaign_id),
+            )
+            return cursor.fetchone()
+
+    def set_campaign_archived(self, user_id: int, campaign_id: int, is_archived: bool) -> dict | None:
+        with self.conn() as (conn, cursor):
+            cursor.execute(
+                """
+                UPDATE campaigns
+                SET is_archived=%s, updated_at=CURRENT_TIMESTAMP
+                WHERE user_id=%s AND id=%s
+                RETURNING id, user_id, name, description, is_archived, created_at, updated_at
+                """,
+                (bool(is_archived), user_id, campaign_id),
+            )
+            row = cursor.fetchone()
+            conn.commit()
+            return row
+
+    def attach_contacts_to_campaign_by_phones(self, user_id: int, campaign_id: int, phones: list[str]) -> dict:
+        """
+        Given phone numbers, attach matching contacts (by exact phone_number match) to campaign.
+        Assumes contacts already inserted via save_contacts_bulk.
+        """
+        phones = [p.strip() for p in (phones or []) if isinstance(p, str) and p.strip()]
+        if not phones:
+            return {"attached": 0}
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            cursor.execute(
+                """
+                INSERT INTO campaign_contacts (campaign_id, contact_id)
+                SELECT %s, c.id
+                FROM contacts c
+                WHERE c.user_id=%s AND c.phone_number = ANY(%s)
+                ON CONFLICT (campaign_id, contact_id) DO NOTHING
+                """,
+                (campaign_id, user_id, phones),
+            )
+            attached = cursor.rowcount or 0
+            conn.commit()
+            return {"attached": attached}
+
+    def count_campaign_contacts(self, user_id: int, campaign_id: int) -> int:
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            cursor.execute(
+                """
+                SELECT COUNT(*)
+                FROM campaign_contacts cc
+                JOIN campaigns c ON c.id=cc.campaign_id
+                WHERE c.user_id=%s AND c.id=%s
+                """,
+                (user_id, campaign_id),
+            )
+            return int(cursor.fetchone()[0] or 0)
+
+    def list_campaign_contact_phones(self, user_id: int, campaign_id: int) -> list[str]:
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            cursor.execute(
+                """
+                SELECT ct.phone_number
+                FROM campaign_contacts cc
+                JOIN campaigns c ON c.id=cc.campaign_id
+                JOIN contacts ct ON ct.id=cc.contact_id
+                WHERE c.user_id=%s AND c.id=%s
+                ORDER BY cc.id ASC
+                """,
+                (user_id, campaign_id),
+            )
+            rows = cursor.fetchall() or []
+            return [r[0] for r in rows if r and r[0]]
+
+    # ---------------- Campaign runs ----------------
+    def create_campaign_run(self, user_id: int, campaign_id: int, batch_size: int = 15) -> dict:
+        with self.conn() as (conn, cursor):
+            cursor.execute(
+                """
+                INSERT INTO campaign_runs (campaign_id, user_id, status, batch_size)
+                VALUES (%s,%s,'queued',%s)
+                RETURNING id, campaign_id, user_id, status, batch_size, total_contacts, processed_contacts,
+                          initiated_calls, failed_calls, started_at, ended_at, last_error, created_at
+                """,
+                (campaign_id, user_id, int(batch_size)),
+            )
+            conn.commit()
+            return cursor.fetchone()
+
+    def update_campaign_run(self, run_id: int, updates: dict) -> None:
+        if not updates:
+            return
+        allowed = {
+            "status",
+            "total_contacts",
+            "processed_contacts",
+            "initiated_calls",
+            "failed_calls",
+            "started_at",
+            "ended_at",
+            "last_error",
+        }
+        sets = []
+        vals = []
+        for k, v in updates.items():
+            if k not in allowed:
+                continue
+            sets.append(f"{k}=%s")
+            vals.append(v)
+        if not sets:
+            return
+        vals.append(run_id)
+        sql = f"UPDATE campaign_runs SET {', '.join(sets)} WHERE id=%s"
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            cursor.execute(sql, tuple(vals))
+            conn.commit()
+
+    def get_campaign_run(self, user_id: int, run_id: int) -> dict | None:
+        with self.conn() as (conn, cursor):
+            cursor.execute(
+                """
+                SELECT id, campaign_id, user_id, status, batch_size, total_contacts, processed_contacts,
+                       initiated_calls, failed_calls, started_at, ended_at, last_error, created_at
+                FROM campaign_runs
+                WHERE user_id=%s AND id=%s
+                """,
+                (user_id, run_id),
+            )
+            return cursor.fetchone()
+
+    def get_campaign_call_stats(self, user_id: int, campaign_id: int) -> dict:
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_calls,
+                    SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_calls,
+                    SUM(CASE WHEN status!='completed' THEN 1 ELSE 0 END) AS not_completed_calls
+                FROM call_history
+                WHERE user_id=%s AND campaign_id=%s
+                """,
+                (user_id, campaign_id),
+            )
+            row = cursor.fetchone() or (0, 0, 0)
+            return {
+                "total_calls": int(row[0] or 0),
+                "completed_calls": int(row[1] or 0),
+                "not_completed_calls": int(row[2] or 0),
+            }
+
+    def get_campaign_run_call_stats(self, user_id: int, run_id: int) -> dict:
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_calls,
+                    SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_calls,
+                    SUM(CASE WHEN status!='completed' THEN 1 ELSE 0 END) AS not_completed_calls
+                FROM call_history
+                WHERE user_id=%s AND campaign_run_id=%s
+                """,
+                (user_id, run_id),
+            )
+            row = cursor.fetchone() or (0, 0, 0)
+            return {
+                "total_calls": int(row[0] or 0),
+                "completed_calls": int(row[1] or 0),
+                "not_completed_calls": int(row[2] or 0),
+            }
 
     # ============================= USERS LOGIC START =============================
     def register_user(self, user_data):
@@ -824,11 +1153,14 @@ class PGDB:
         status: str = None,
         voice_id: str = None,
         voice_name: str = None,
+        from_number: str = None,
         to_number: str = None,
         contact_first_name: str = None,
         contact_email: str = None,
         category: str = None,
-        call_outcome_status: str = None
+        call_outcome_status: str = None,
+        campaign_id: int = None,
+        campaign_run_id: int = None,
     ):
         """
         Insert a new call history record with initial data.
@@ -838,19 +1170,34 @@ class PGDB:
             try:
                 values = (
                     user_id, call_id, status,
-                    voice_id, voice_name, to_number,
+                    voice_id, voice_name, from_number, to_number,
                     contact_first_name, contact_email, category, call_outcome_status
                 )
                 cursor.execute("""
                     INSERT INTO call_history (
                         user_id, call_id, status,
-                        voice_id, voice_name, to_number,
+                        voice_id, voice_name, from_number, to_number,
                         contact_first_name, contact_email, category, call_outcome_status
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     RETURNING id;
                 """, values)
                 row = cursor.fetchone()
+                # Optional campaign linkage
+                if campaign_id is not None or campaign_run_id is not None:
+                    updates = {}
+                    if campaign_id is not None:
+                        updates["campaign_id"] = int(campaign_id)
+                    if campaign_run_id is not None:
+                        updates["campaign_run_id"] = int(campaign_run_id)
+                    if updates:
+                        try:
+                            cursor.execute(
+                                "UPDATE call_history SET campaign_id = COALESCE(%s, campaign_id), campaign_run_id = COALESCE(%s, campaign_run_id) WHERE call_id=%s",
+                                (updates.get("campaign_id"), updates.get("campaign_run_id"), call_id),
+                            )
+                        except Exception:
+                            pass
                 conn.commit()
                 return row[0] if row else None
             except Exception as e:
@@ -935,6 +1282,7 @@ class PGDB:
                         ch.voice_id, ch.voice_name, ch.from_number, ch.to_number,
                         ch.contact_first_name, ch.contact_email, ch.category, ch.call_outcome_status,
                         c.call_status AS contact_call_status,
+                        ch.transcript_url, ch.transcript_blob,
                         ch.recording_blob,  -- ✅ ADD THIS
                         u.id AS user_id, u.username, u.email
                     FROM call_history ch
@@ -986,6 +1334,126 @@ class PGDB:
                 return {row[0]: row[1] for row in rows}
             except Exception as e:
                 logging.error(f"Error getting call outcome summary: {e}")
+                raise
+
+    def get_analytics_summary(self, user_id: int) -> dict:
+        """
+        Analytics summary for a user's calls (similar to CallFlow_Backend-main /agent/analytics-summary).
+        """
+        from datetime import datetime, timezone, timedelta
+
+        now = datetime.now(timezone.utc)
+        week_start = now - timedelta(days=now.weekday())
+        week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        last_week_start = week_start - timedelta(days=7)
+
+        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+        with self.conn(dict_cursor=False) as (conn, cursor):
+            try:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM call_history WHERE user_id = %s",
+                    (user_id,),
+                )
+                total_calls = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(duration), 0) AS total_duration,
+                        COALESCE(AVG(duration), 0) AS avg_duration
+                    FROM call_history
+                    WHERE user_id = %s AND duration IS NOT NULL
+                    """,
+                    (user_id,),
+                )
+                row = cursor.fetchone()
+                total_talk_time_seconds = int((row[0] or 0))
+                avg_call_duration_seconds = int((row[1] or 0))
+                total_talk_time_minutes = round(total_talk_time_seconds / 60, 2)
+                avg_call_duration_minutes = round(avg_call_duration_seconds / 60, 2)
+
+                cursor.execute(
+                    """
+                    SELECT DATE(created_at) AS d, COUNT(*) AS calls
+                    FROM call_history
+                    WHERE user_id = %s
+                    GROUP BY DATE(created_at)
+                    ORDER BY DATE(created_at)
+                    """,
+                    (user_id,),
+                )
+                daily_rows = cursor.fetchall() or []
+
+                daily_data = []
+                peak_day = None
+                peak_calls = 0
+                for d, calls in daily_rows:
+                    try:
+                        # d is usually a date; normalize for safety
+                        iso = d.isoformat() if hasattr(d, "isoformat") else str(d)
+                        weekday = d.weekday() if hasattr(d, "weekday") else None
+                    except Exception:
+                        iso = str(d)
+                        weekday = None
+                    day = day_names[weekday] if isinstance(weekday, int) and 0 <= weekday <= 6 else None
+                    calls_i = int(calls or 0)
+                    daily_data.append({"date": iso, "day": day, "calls": calls_i})
+                    if calls_i > peak_calls:
+                        peak_calls = calls_i
+                        peak_day = day
+
+                total_days_with_calls = len(daily_data)
+                daily_average = round(total_calls / total_days_with_calls, 2) if total_days_with_calls > 0 else 0
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM call_history
+                    WHERE user_id = %s AND created_at >= %s AND created_at <= %s
+                    """,
+                    (user_id, week_start, now),
+                )
+                this_week_calls = int(cursor.fetchone()[0] or 0)
+
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM call_history
+                    WHERE user_id = %s AND created_at >= %s AND created_at < %s
+                    """,
+                    (user_id, last_week_start, week_start),
+                )
+                last_week_calls = int(cursor.fetchone()[0] or 0)
+
+                if last_week_calls > 0:
+                    vs_last_week_percent = round(((this_week_calls - last_week_calls) / last_week_calls) * 100, 1)
+                else:
+                    vs_last_week_percent = 100.0 if this_week_calls > 0 else 0.0
+
+                return {
+                    "summary": {
+                        "total_calls": total_calls,
+                        "avg_call_duration_seconds": avg_call_duration_seconds,
+                        "avg_call_duration_minutes": avg_call_duration_minutes,
+                        "total_talk_time_seconds": total_talk_time_seconds,
+                        "total_talk_time_minutes": total_talk_time_minutes,
+                    },
+                    "trends": {
+                        "daily_data": daily_data,
+                        "peak_day": peak_day,
+                        "daily_average": daily_average,
+                        "total_calls": total_calls,
+                        "total_days_with_calls": total_days_with_calls,
+                    },
+                    "comparison": {
+                        "this_week_calls": this_week_calls,
+                        "last_week_calls": last_week_calls,
+                        "vs_last_week_percent": vs_last_week_percent,
+                    },
+                }
+            except Exception as e:
+                logging.error(f"Error getting analytics summary: {e}")
                 raise
 
     def create_appointment(
